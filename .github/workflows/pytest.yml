@@ -84,7 +84,7 @@ jobs:
           root.destroy()
           PY
 
-      - name: Run original-order prefix in three fresh pytest processes
+      - name: Run two remaining original-order prefix trials
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -134,8 +134,9 @@ jobs:
           PY_PLUGIN
           export PYTHONPATH="$RUNNER_TEMP${PYTHONPATH:+:$PYTHONPATH}"
           overall=0
-          for run in 1 2 3; do
+          for run in 2 3; do
             echo "::group::original-order prefix run $run"
+            set +e
             AMC_PREFIX_RUN="$run" PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1 uv run pytest \
               -p amc_prefix_plugin \
               --cov=ardupilot_methodic_configurator \
@@ -144,6 +145,7 @@ jobs:
               --junit-xml="$RUNNER_TEMP/amc-prefix-$run-junit.xml" \
               -m "not sitl" 2>&1 | tee "$RUNNER_TEMP/amc-prefix-$run-raw.log"
             status=${PIPESTATUS[0]}
+            set -e
             printf 'pytest exit: %s\n' "$status" > "$diag/run-$run-exit.txt"
             AMC_PREFIX_RUN="$run" python - <<'PY_REDACT'
           import os
