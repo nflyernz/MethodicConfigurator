@@ -110,22 +110,27 @@ jobs:
           import time
 
           state = pathlib.Path(os.environ['AMC_TK_DIAG']) / 'current-test.json'
+          replace_file = os.replace
+          write_text = pathlib.Path.write_text
+          get_pid = os.getpid
+          monotonic = time.monotonic
+          epoch = time.time
           started = 0.0
 
           def record(test, phase):
-              payload = {'pid': os.getpid(), 'test': test, 'phase': phase,
-                         'started_monotonic': started, 'phase_started_monotonic': time.monotonic(),
-                         'recorded_epoch': time.time()}
+              payload = {'pid': get_pid(), 'test': test, 'phase': phase,
+                         'started_monotonic': started, 'phase_started_monotonic': monotonic(),
+                         'recorded_epoch': epoch()}
               temporary = state.with_suffix('.tmp')
-              temporary.write_text(json.dumps(payload), encoding='utf-8')
-              os.replace(temporary, state)
+              write_text(temporary, json.dumps(payload), encoding='utf-8')
+              replace_file(temporary, state)
 
           import pytest
 
           @pytest.hookimpl(hookwrapper=True)
           def pytest_runtest_protocol(item, nextitem):
               global started
-              started = time.monotonic()
+              started = monotonic()
               record(item.nodeid, 'protocol')
               yield
               record('', 'idle')
