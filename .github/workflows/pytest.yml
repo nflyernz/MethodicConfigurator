@@ -107,51 +107,71 @@ jobs:
           import json
           import os
           import pathlib
+          import sys
           import time
+          import tkinter as tk
 
-          state = pathlib.Path(os.environ['AMC_TK_DIAG']) / 'current-test.json'
+          output = pathlib.Path(os.environ['AMC_TK_DIAG'])
+          state = output / 'current-call.json'
+          calls = output / 'update-idletasks-calls.jsonl'
           replace_file = os.replace
           write_text = pathlib.Path.write_text
           get_pid = os.getpid
           monotonic = time.monotonic
           epoch = time.time
-          started = 0.0
+          original_update = tk.Misc.update_idletasks
+          current_test = ''
+          next_call_id = 0
 
-          def record(test, phase):
-              payload = {'pid': get_pid(), 'test': test, 'phase': phase,
-                         'started_monotonic': started, 'phase_started_monotonic': monotonic(),
-                         'recorded_epoch': epoch()}
+          def publish(payload):
               temporary = state.with_suffix('.tmp')
               write_text(temporary, json.dumps(payload), encoding='utf-8')
               replace_file(temporary, state)
 
+          def log(payload):
+              with calls.open('a', encoding='utf-8') as stream:
+                  stream.write(json.dumps(payload) + '\n')
+
+          def traced_update(widget):
+              global next_call_id
+              caller = sys._getframe(1)
+              if not caller.f_code.co_filename.endswith('tests/test_frontend_tkinter_parameter_editor.py'):
+                  return original_update(widget)
+              next_call_id += 1
+              began = monotonic()
+              event = {'call_id': next_call_id, 'pid': get_pid(), 'test': current_test,
+                       'caller': caller.f_code.co_name, 'line': caller.f_lineno,
+                       'widget_type': type(widget).__name__, 'widget_path': getattr(widget, '_w', ''),
+                       'started_monotonic': began, 'started_epoch': epoch()}
+              log({**event, 'event': 'enter'})
+              publish({**event, 'active': True})
+              try:
+                  return original_update(widget)
+              finally:
+                  finished = monotonic()
+                  publish({**event, 'active': False, 'finished_monotonic': finished,
+                           'duration_seconds': finished - began})
+                  log({**event, 'event': 'exit', 'finished_monotonic': finished,
+                       'duration_seconds': finished - began})
+
           import pytest
 
-          @pytest.hookimpl(hookwrapper=True)
+          @pytest.hookimpl(hookwrapper=True, tryfirst=True)
           def pytest_runtest_protocol(item, nextitem):
-              global started
-              started = monotonic()
-              record(item.nodeid, 'protocol')
-              yield
-              record('', 'idle')
-
-          @pytest.hookimpl(hookwrapper=True)
-          def pytest_runtest_setup(item):
-              record(item.nodeid, 'setup')
-              yield
-
-          @pytest.hookimpl(hookwrapper=True)
-          def pytest_runtest_call(item):
-              record(item.nodeid, 'call')
-              yield
-
-          @pytest.hookimpl(hookwrapper=True)
-          def pytest_runtest_teardown(item, nextitem):
-              record(item.nodeid, 'teardown')
-              yield
+              global current_test
+              if 'TestWindowSizing' not in item.nodeid:
+                  yield
+                  return
+              current_test = item.nodeid
+              tk.Misc.update_idletasks = traced_update
+              try:
+                  yield
+              finally:
+                  tk.Misc.update_idletasks = original_update
+                  current_test = ''
 
           def pytest_sessionfinish(session, exitstatus):
-              record('', 'finished')
+              publish({'active': False, 'finished': True, 'pid': get_pid()})
           PY
           cat > "$RUNNER_TEMP/amc_watchdog.py" <<'PY'
           import json
@@ -161,8 +181,11 @@ jobs:
           import time
 
           output = pathlib.Path(os.environ['AMC_TK_DIAG'])
-          state = output / 'current-test.json'
-          sampled_phases = set()
+          state = output / 'current-call.json'
+          target = ('tests/test_frontend_tkinter_parameter_editor.py::TestWindowSizing::'
+                    'test_real_component_fields_remain_accessible_after_rebuilding'
+                    '[1920x1080-144dpi-fitting-fields-immediate]')
+          selected_call = None
           sample_count = 0
           while True:
               try:
@@ -170,22 +193,23 @@ jobs:
               except (FileNotFoundError, json.JSONDecodeError):
                   time.sleep(0.25)
                   continue
-              if current['phase'] == 'finished':
+              if current.get('finished'):
                   break
               pid = current['pid']
               try:
                   os.kill(pid, 0)
               except ProcessLookupError:
                   break
-              elapsed = time.monotonic() - current['phase_started_monotonic']
-              key = (current['test'], current['phase'])
-              if (sample_count < 5 and key not in sampled_phases and
-                      'TestWindowSizing' in current['test'] and elapsed >= 20):
-                  sampled_phases.add(key)
+              elapsed = time.monotonic() - current.get('started_monotonic', time.monotonic())
+              if (current.get('active') and current.get('test') == target and
+                      elapsed >= (10 if sample_count == 0 else 18) and
+                      (selected_call is None or selected_call == current['call_id']) and
+                      sample_count < 2):
+                  selected_call = current['call_id']
                   sample_count += 1
                   suffix = str(sample_count)
                   (output / f'trigger-{suffix}.json').write_text(
-                      json.dumps({**current, 'phase_elapsed_seconds': elapsed}, indent=2), encoding='utf-8')
+                      json.dumps({**current, 'call_elapsed_seconds': elapsed}, indent=2), encoding='utf-8')
                   try:
                       result = subprocess.run(
                           ['/usr/bin/sample', str(pid), '5', '-file', str(output / f'pytest-native-sample-{suffix}.txt')],
