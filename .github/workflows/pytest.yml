@@ -1,4 +1,4 @@
-name: Pytest macOS Tk root lifecycle diagnostic
+name: Pytest macOS Tk original-order prefix diagnostic
 
 on:
   workflow_dispatch:
@@ -84,61 +84,92 @@ jobs:
           root.destroy()
           PY
 
-      - name: Run bounded Tk root lifecycle selections
+      - name: Run original-order prefix in three fresh pytest processes
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -uo pipefail
           diag="$AMC_TK_DIAG"
-          module="tests/gui_frontend_tkinter_parameter_editor.py"
-          full_case="$module::TestParameterEditorWindow::test_full_gui_with_pyautogui"
-          about_case="$module::TestParameterEditorWindow::test_show_about_window"
-          overall=0
-
-          run_selection() {
-            label="$1"
-            shift
-            printf 'selection: %s\n' "$label" > "$diag/$label-selection.txt"
-            printf 'node: %s\n' "$@" >> "$diag/$label-selection.txt"
-            echo "::group::$label"
-            PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1 uv run pytest \
-              --cov=ardupilot_methodic_configurator \
-              --cov-report="xml:$RUNNER_TEMP/amc-$label-coverage.xml" \
-              --md="$RUNNER_TEMP/amc-$label-results.md" \
-              --junit-xml="$RUNNER_TEMP/amc-$label-junit.xml" \
-              -m "not sitl" "$@" 2>&1 | tee "$RUNNER_TEMP/amc-$label-raw.log"
-            status=${PIPESTATUS[0]}
-            printf 'pytest exit: %s\n' "$status" > "$diag/$label-exit.txt"
-            AMC_CASE="$label" python - <<'PY_REDACT'
+          cat > "$RUNNER_TEMP/amc_prefix_plugin.py" <<'PY_PLUGIN'
           import os
-          import pathlib
+          from pathlib import Path
 
-          label = os.environ['AMC_CASE']
-          raw = pathlib.Path(os.environ['RUNNER_TEMP']) / f'amc-{label}-raw.log'
+          import pytest
+
+          output = Path(os.environ['AMC_TK_DIAG'])
+          run = os.environ['AMC_PREFIX_RUN']
+          target = (
+              'tests/gui_frontend_tkinter_parameter_editor.py::'
+              'TestParameterEditorWindow::test_show_about_window'
+          )
+
+          @pytest.hookimpl(trylast=True)
+          def pytest_collection_finish(session):
+              all_ids = [item.nodeid for item in session.items]
+              (output / f'run-{run}-collected.txt').write_text(
+                  '\n'.join(all_ids) + '\n', encoding='utf-8'
+              )
+              matches = [index for index, nodeid in enumerate(all_ids) if nodeid == target]
+              if len(matches) != 1:
+                  raise pytest.UsageError(f'Expected one target case; found {len(matches)}')
+              if matches[0] >= 1000:
+                  raise pytest.UsageError(f'Target moved beyond bounded prefix: index {matches[0]}')
+              prefix = all_ids[:matches[0] + 1]
+              (output / f'run-{run}-prefix.txt').write_text(
+                  '\n'.join(prefix) + '\n', encoding='utf-8'
+              )
+              (output / f'run-{run}-counts.txt').write_text(
+                  f'collected: {len(all_ids)}\nprefix: {len(prefix)}\n', encoding='utf-8'
+              )
+              session.items[:] = session.items[:matches[0] + 1]
+
+          def pytest_runtest_logstart(nodeid, location):
+              with (output / f'run-{run}-started.txt').open('a', encoding='utf-8') as stream:
+                  stream.write(nodeid + '\n')
+
+          def pytest_runtest_logreport(report):
+              with (output / f'run-{run}-results.txt').open('a', encoding='utf-8') as stream:
+                  stream.write(f'{report.nodeid}\t{report.when}\t{report.outcome}\n')
+          PY_PLUGIN
+          export PYTHONPATH="$RUNNER_TEMP${PYTHONPATH:+:$PYTHONPATH}"
+          overall=0
+          for run in 1 2 3; do
+            echo "::group::original-order prefix run $run"
+            AMC_PREFIX_RUN="$run" PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1 uv run pytest \
+              -p amc_prefix_plugin \
+              --cov=ardupilot_methodic_configurator \
+              --cov-report="xml:$RUNNER_TEMP/amc-prefix-$run-coverage.xml" \
+              --md="$RUNNER_TEMP/amc-prefix-$run-results.md" \
+              --junit-xml="$RUNNER_TEMP/amc-prefix-$run-junit.xml" \
+              -m "not sitl" 2>&1 | tee "$RUNNER_TEMP/amc-prefix-$run-raw.log"
+            status=${PIPESTATUS[0]}
+            printf 'pytest exit: %s\n' "$status" > "$diag/run-$run-exit.txt"
+            AMC_PREFIX_RUN="$run" python - <<'PY_REDACT'
+          import os
+          from pathlib import Path
+
+          run = os.environ['AMC_PREFIX_RUN']
+          raw = Path(os.environ['RUNNER_TEMP']) / f'amc-prefix-{run}-raw.log'
           log = raw.read_text(encoding='utf-8', errors='replace')
           token = os.environ.get('GITHUB_TOKEN', '')
           if token:
               log = log.replace(token, '[REDACTED]')
-          (pathlib.Path(os.environ['AMC_TK_DIAG']) / f'{label}-pytest.log').write_text(log, encoding='utf-8')
+          (Path(os.environ['AMC_TK_DIAG']) / f'run-{run}-pytest.log').write_text(log, encoding='utf-8')
           raw.unlink()
           PY_REDACT
             echo "::endgroup::"
             if [ "$status" -ne 0 ]; then
               overall=1
             fi
-          }
-
-          run_selection alone "$about_case"
-          run_selection ordered_pair "$full_case" "$about_case"
-          run_selection whole_module "$module"
+          done
           exit "$overall"
 
       - name: Upload Tk diagnostic evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: macos-python315-tk-root-lifecycle
+          name: macos-python315-tk-original-order-prefix
           path: ${{ runner.temp }}/amc-tk-diagnostic/
           if-no-files-found: warn
           retention-days: 3
