@@ -1,4 +1,4 @@
-name: Pytest macOS Tk diagnostic
+name: Pytest macOS Tk root lifecycle diagnostic
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
 jobs:
   pytest:
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 20
     steps:
       - name: Harden the runner (Audit all outbound calls)
         uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
@@ -51,14 +51,13 @@ jobs:
       - name: Install project in editable mode
         run: uv pip install --python "$VIRTUAL_ENV/bin/python" --editable "." --no-deps
 
-      - name: Record runtime and verify native sampling
+      - name: Record Python and Tcl/Tk runtime
         shell: bash
         run: |
           set -euo pipefail
           diag="$RUNNER_TEMP/amc-tk-diagnostic"
           mkdir -p "$diag"
           echo "AMC_TK_DIAG=$diag" >> "$GITHUB_ENV"
-          command -v sample > "$diag/sample-path.txt"
           python - <<'PY' > "$diag/runtime.txt" 2>&1
           import _tkinter
           import os
@@ -84,171 +83,62 @@ jobs:
                   print(line, flush=True)
           root.destroy()
           PY
-          python -c 'import time; time.sleep(8)' &
-          probe_pid=$!
-          set +e
-          sample "$probe_pid" 1 -file "$diag/sample-probe.txt" > "$diag/sample-probe-output.txt" 2>&1
-          probe_status=$?
-          set -e
-          kill "$probe_pid" 2>/dev/null || true
-          wait "$probe_pid" 2>/dev/null || true
-          echo "probe exit: $probe_status" >> "$diag/sample-probe-output.txt"
-          test "$probe_status" -eq 0
-          test -s "$diag/sample-probe.txt"
 
-      - name: Run full pytest selection with independent watchdog
+      - name: Run bounded Tk root lifecycle selections
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -uo pipefail
           diag="$AMC_TK_DIAG"
-          cat > "$RUNNER_TEMP/amc_diag_plugin.py" <<'PY'
-          import json
+          module="tests/gui_frontend_tkinter_parameter_editor.py"
+          full_case="$module::TestParameterEditorWindow::test_full_gui_with_pyautogui"
+          about_case="$module::TestParameterEditorWindow::test_show_about_window"
+          overall=0
+
+          run_selection() {
+            label="$1"
+            shift
+            printf 'selection: %s\n' "$label" > "$diag/$label-selection.txt"
+            printf 'node: %s\n' "$@" >> "$diag/$label-selection.txt"
+            echo "::group::$label"
+            PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1 uv run pytest \
+              --cov=ardupilot_methodic_configurator \
+              --cov-report="xml:$RUNNER_TEMP/amc-$label-coverage.xml" \
+              --md="$RUNNER_TEMP/amc-$label-results.md" \
+              --junit-xml="$RUNNER_TEMP/amc-$label-junit.xml" \
+              -m "not sitl" "$@" 2>&1 | tee "$RUNNER_TEMP/amc-$label-raw.log"
+            status=${PIPESTATUS[0]}
+            printf 'pytest exit: %s\n' "$status" > "$diag/$label-exit.txt"
+            AMC_CASE="$label" python - <<'PY_REDACT'
           import os
           import pathlib
-          import sys
-          import time
-          import tkinter as tk
 
-          output = pathlib.Path(os.environ['AMC_TK_DIAG'])
-          state = output / 'current-call.json'
-          calls = output / 'update-idletasks-calls.jsonl'
-          replace_file = os.replace
-          write_text = pathlib.Path.write_text
-          get_pid = os.getpid
-          monotonic = time.monotonic
-          epoch = time.time
-          original_update = tk.Misc.update_idletasks
-          current_test = ''
-          next_call_id = 0
-
-          def publish(payload):
-              temporary = state.with_suffix('.tmp')
-              write_text(temporary, json.dumps(payload), encoding='utf-8')
-              replace_file(temporary, state)
-
-          def log(payload):
-              with calls.open('a', encoding='utf-8') as stream:
-                  stream.write(json.dumps(payload) + '\n')
-
-          def traced_update(widget):
-              global next_call_id
-              caller = sys._getframe(1)
-              if not caller.f_code.co_filename.endswith('tests/test_frontend_tkinter_parameter_editor.py'):
-                  return original_update(widget)
-              next_call_id += 1
-              began = monotonic()
-              event = {'call_id': next_call_id, 'pid': get_pid(), 'test': current_test,
-                       'caller': caller.f_code.co_name, 'line': caller.f_lineno,
-                       'widget_type': type(widget).__name__, 'widget_path': getattr(widget, '_w', ''),
-                       'started_monotonic': began, 'started_epoch': epoch()}
-              log({**event, 'event': 'enter'})
-              publish({**event, 'active': True})
-              try:
-                  return original_update(widget)
-              finally:
-                  finished = monotonic()
-                  publish({**event, 'active': False, 'finished_monotonic': finished,
-                           'duration_seconds': finished - began})
-                  log({**event, 'event': 'exit', 'finished_monotonic': finished,
-                       'duration_seconds': finished - began})
-
-          import pytest
-
-          @pytest.hookimpl(hookwrapper=True, tryfirst=True)
-          def pytest_runtest_protocol(item, nextitem):
-              global current_test
-              if 'TestWindowSizing' not in item.nodeid:
-                  yield
-                  return
-              current_test = item.nodeid
-              tk.Misc.update_idletasks = traced_update
-              try:
-                  yield
-              finally:
-                  tk.Misc.update_idletasks = original_update
-                  current_test = ''
-
-          def pytest_sessionfinish(session, exitstatus):
-              publish({'active': False, 'finished': True, 'pid': get_pid()})
-          PY
-          cat > "$RUNNER_TEMP/amc_watchdog.py" <<'PY'
-          import json
-          import os
-          import pathlib
-          import subprocess
-          import time
-
-          output = pathlib.Path(os.environ['AMC_TK_DIAG'])
-          state = output / 'current-call.json'
-          target = ('tests/test_frontend_tkinter_parameter_editor.py::TestWindowSizing::'
-                    'test_real_component_fields_remain_accessible_after_rebuilding'
-                    '[1920x1080-144dpi-fitting-fields-immediate]')
-          selected_call = None
-          sample_count = 0
-          while True:
-              try:
-                  current = json.loads(state.read_text(encoding='utf-8'))
-              except (FileNotFoundError, json.JSONDecodeError):
-                  time.sleep(0.25)
-                  continue
-              if current.get('finished'):
-                  break
-              pid = current['pid']
-              try:
-                  os.kill(pid, 0)
-              except ProcessLookupError:
-                  break
-              elapsed = time.monotonic() - current.get('started_monotonic', time.monotonic())
-              if (current.get('active') and current.get('test') == target and
-                      elapsed >= (10 if sample_count == 0 else 18) and
-                      (selected_call is None or selected_call == current['call_id']) and
-                      sample_count < 2):
-                  selected_call = current['call_id']
-                  sample_count += 1
-                  suffix = str(sample_count)
-                  (output / f'trigger-{suffix}.json').write_text(
-                      json.dumps({**current, 'call_elapsed_seconds': elapsed}, indent=2), encoding='utf-8')
-                  try:
-                      result = subprocess.run(
-                          ['/usr/bin/sample', str(pid), '5', '-file', str(output / f'pytest-native-sample-{suffix}.txt')],
-                          capture_output=True, text=True, timeout=9, check=False)
-                      (output / f'sample-result-{suffix}.txt').write_text(
-                          f'exit: {result.returncode}\n{result.stdout}\n{result.stderr}', encoding='utf-8')
-                  except subprocess.TimeoutExpired as error:
-                      (output / f'sample-result-{suffix}.txt').write_text(f'sample timed out: {error}', encoding='utf-8')
-              time.sleep(0.25)
-          PY
-          export PYTHONPATH="$RUNNER_TEMP${PYTHONPATH:+:$PYTHONPATH}"
-          python "$RUNNER_TEMP/amc_watchdog.py" > "$diag/watchdog.log" 2>&1 &
-          watchdog_pid=$!
-          set +e
-          PYTHONUNBUFFERED=1 uv run pytest -p amc_diag_plugin --cov=ardupilot_methodic_configurator --cov-report=xml:tests/coverage.xml --md=tests/results-3.15.2.md --junit-xml=tests/results-junit.xml -m "not sitl" 2>&1 | tee "$RUNNER_TEMP/amc-pytest-raw.log"
-          test_status=${PIPESTATUS[0]}
-          set -e
-          echo "pytest exit: $test_status" > "$diag/pytest-exit.txt"
-          # The token is available to tests as in normal CI; redact it before artifact upload.
-          python - <<'PY'
-          import os
-          import pathlib
-          path = pathlib.Path(os.environ['RUNNER_TEMP']) / 'amc-pytest-raw.log'
-          text = path.read_text(encoding='utf-8', errors='replace')
+          label = os.environ['AMC_CASE']
+          raw = pathlib.Path(os.environ['RUNNER_TEMP']) / f'amc-{label}-raw.log'
+          log = raw.read_text(encoding='utf-8', errors='replace')
           token = os.environ.get('GITHUB_TOKEN', '')
           if token:
-              text = text.replace(token, '[REDACTED]')
-          (pathlib.Path(os.environ['AMC_TK_DIAG']) / 'pytest.log').write_text(text, encoding='utf-8')
-          path.unlink()
-          PY
-          kill "$watchdog_pid" 2>/dev/null || true
-          wait "$watchdog_pid" || true
-          exit "$test_status"
+              log = log.replace(token, '[REDACTED]')
+          (pathlib.Path(os.environ['AMC_TK_DIAG']) / f'{label}-pytest.log').write_text(log, encoding='utf-8')
+          raw.unlink()
+          PY_REDACT
+            echo "::endgroup::"
+            if [ "$status" -ne 0 ]; then
+              overall=1
+            fi
+          }
+
+          run_selection alone "$about_case"
+          run_selection ordered_pair "$full_case" "$about_case"
+          run_selection whole_module "$module"
+          exit "$overall"
 
       - name: Upload Tk diagnostic evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: macos-python315-tk-native-diagnostic
+          name: macos-python315-tk-root-lifecycle
           path: ${{ runner.temp }}/amc-tk-diagnostic/
           if-no-files-found: warn
           retention-days: 3
