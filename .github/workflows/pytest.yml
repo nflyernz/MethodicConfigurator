@@ -1,4 +1,4 @@
-name: Pytest macOS Tk isolated sizing diagnostic
+name: Pytest macOS Tk bare-root lifecycle diagnostic
 
 on:
   workflow_dispatch:
@@ -84,7 +84,7 @@ jobs:
           root.destroy()
           PY
 
-      - name: Run Trial Q isolated sizing case
+      - name: Run Trial R bare-root lifecycle control
         shell: bash
         run: |
           set -euo pipefail
@@ -100,10 +100,11 @@ jobs:
 
           import pytest
 
+          BARE = "tests/test_amc_tk_bare_root_diagnostic.py::test_bare_tk_root_lifecycle"
           TARGET = ("tests/test_frontend_tkinter_parameter_editor.py::TestWindowSizing::"
                     "test_user_can_close_editor_with_resize_queued[main-frame]")
-          EXPECTED_COUNT = 1
-          EXPECTED_SHA256 = "87f4f7a444ce588537d5ac604cd5433e5e003720d333437371e1fac90ab7e407"
+          EXPECTED_COUNT = 2
+          EXPECTED_SHA256 = "11c0fed81b120f5712a6a8178fbd4cc09122b12b9f3297ec6152c5566eed2b9e"
           DIAG = Path(os.environ["AMC_TK_DIAG"])
           START = time.monotonic_ns()
           FD = None
@@ -113,21 +114,24 @@ jobs:
 
 
           def selection(items):
+              bare = [item for item in items if item.nodeid == BARE]
               target = [item for item in items if item.nodeid == TARGET]
-              if len(target) != 1:
-                  raise pytest.UsageError("target sizing case missing or duplicated")
-              chosen = target
+              if len(bare) != 1 or len(target) != 1:
+                  raise pytest.UsageError("bare-root or sizing case missing or duplicated")
+              if items.index(bare[0]) >= items.index(target[0]):
+                  raise pytest.UsageError("bare-root test did not collect before sizing case")
+              chosen = bare + target
               chosen_ids = [item.nodeid for item in chosen]
               text = "\n".join(chosen_ids) + "\n"
               digest = hashlib.sha256(text.encode()).hexdigest()
               if (len(chosen_ids), digest) != (EXPECTED_COUNT, EXPECTED_SHA256):
-                  raise pytest.UsageError("Trial Q ID, count or hash changed")
-              if chosen_ids != [TARGET]:
-                  raise pytest.UsageError("Trial Q selected an unexpected test ID")
-              (DIAG / "Q-selected-test-ids.txt").write_text(text)
+                  raise pytest.UsageError("Trial R IDs, count or hash changed")
+              if chosen_ids != [BARE, TARGET]:
+                  raise pytest.UsageError("Trial R selected unexpected test IDs")
+              (DIAG / "R-selected-test-ids.txt").write_text(text)
               manifest = {"count": len(chosen_ids), "sha256": digest,
                           "first": chosen_ids[0], "last": chosen_ids[-1]}
-              (DIAG / "Q-selection-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+              (DIAG / "R-selection-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
               return chosen
 
 
@@ -139,7 +143,7 @@ jobs:
               excluded = [item for item in items if item.nodeid not in selected]
               config.hook.pytest_deselected(items=excluded)
               items[:] = chosen
-              FD = os.open(DIAG / "Q-phase-trace.jsonl",
+              FD = os.open(DIAG / "R-phase-trace.jsonl",
                            os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
 
 
@@ -209,22 +213,40 @@ jobs:
           PY_CHECK
           }
           check_checkout before
+          temporary_test="tests/test_amc_tk_bare_root_diagnostic.py"
+          test ! -e "$temporary_test"
+          trap 'rm -f "$temporary_test"' EXIT
+          cat > "$temporary_test" <<'PY_BARE'
+          import tkinter as tk
+
+
+          def test_bare_tk_root_lifecycle():
+              root = tk.Tk()
+              try:
+                  pass
+              finally:
+                  root.destroy()
+          PY_BARE
+          cp "$temporary_test" "$diag/R-temporary-test.py"
           set +e
           "$VIRTUAL_ENV/bin/python" -X faulthandler -m pytest -p amc_tk_order_probe \
             --timeout=30 --timeout-method=thread \
             -o "cache_dir=$RUNNER_TEMP/amc-tk-pytest-cache" -vv 2>&1 \
-            | tee "$diag/Q-pytest.log"
+            | tee "$diag/R-pytest.log"
           trial_status=${PIPESTATUS[0]}
           set -e
-          printf 'pytest exit: %s\n' "$trial_status" > "$diag/Q-exit.txt"
-          printf 'Trial Q pytest exit: %s\n' "$trial_status"
+          printf 'pytest exit: %s\n' "$trial_status" > "$diag/R-exit.txt"
+          printf 'Trial R pytest exit: %s\n' "$trial_status"
+          rm -f "$temporary_test"
+          test ! -e "$temporary_test"
+          trap - EXIT
           check_checkout after
 
       - name: Upload Tk diagnostic evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: macos-python315-tk-trial-q-isolated-sizing
+          name: macos-python315-tk-trial-r-bare-root
           path: ${{ runner.temp }}/amc-tk-diagnostic/
           if-no-files-found: warn
           retention-days: 3
