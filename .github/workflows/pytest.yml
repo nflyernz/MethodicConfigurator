@@ -1,4 +1,4 @@
-name: Standalone macOS Tk operation reduction diagnostic
+name: Standalone macOS Tk distribution comparison
 
 on:
   workflow_dispatch:
@@ -84,36 +84,141 @@ jobs:
           root.destroy()
           PY
 
-      - name: Run standalone Tk trials T1 through T5
+      - name: Set up latest stable Python 3.14 on macOS
+        id: python314
+        continue-on-error: true
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+          check-latest: true
+
+      - name: Compare minimum Tk lifecycle across three Python distributions
         shell: bash
+        env:
+          PY314_PATH: ${{ steps.python314.outputs.python-path }}
+          PY314_OUTCOME: ${{ steps.python314.outcome }}
         run: |
           set -euo pipefail
           diag="$AMC_TK_DIAG"
           script="diagnostics/tk_root_idle_reproducer.py"
           test -f "$script"
+          printf 'runner architecture: %s\n' "$(uname -m)" > "$diag/runner-architecture.txt"
+          if [ "$(uname -m)" != arm64 ]; then
+            printf 'unavailable: expected macOS arm64 runner\n' > "$diag/runner-status.txt"
+            exit 0
+          fi
           cp "$script" "$diag/tk_root_idle_reproducer.py"
           shasum -a 256 "$script" > "$diag/script-sha256.txt"
           export PYTHONFAULTHANDLER=1
           export PYTHONUNBUFFERED=1
-          for trial in T1 T2 T3 T4 T5; do
-            case "$trial" in
-              T1) mode=minimum ;;
-              T2) mode=theme-only ;;
-              T3) mode=dpi-only ;;
-              T4) mode=font-only ;;
-              T5) mode=prior-root ;;
-            esac
+          cat > "$diag/runtime_probe.py" <<'PY_RUNTIME'
+          import _tkinter
+          import os
+          import platform
+          import subprocess
+          import sys
+          import tkinter as tk
+
+          print('platform:', platform.platform(), flush=True)
+          print('architecture:', platform.machine(), flush=True)
+          print('python build:', sys.version, flush=True)
+          print('executable:', sys.executable, flush=True)
+          print('real executable:', os.path.realpath(sys.executable), flush=True)
+          print('_tkinter:', _tkinter.__file__, flush=True)
+          print('real _tkinter:', os.path.realpath(_tkinter.__file__), flush=True)
+          print('otool -L executable:', flush=True)
+          subprocess.run(['/usr/bin/otool', '-L', os.path.realpath(sys.executable)], check=False)
+          print('otool -L _tkinter:', flush=True)
+          subprocess.run(['/usr/bin/otool', '-L', _tkinter.__file__], check=False)
+          root = tk.Tk()
+          print('Tcl patchlevel:', root.tk.call('info', 'patchlevel'), flush=True)
+          print('Tk patchlevel:', root.tk.call('package', 'require', 'Tk'), flush=True)
+          print('loaded Tcl/Tk libraries:', flush=True)
+          result = subprocess.run(['/usr/sbin/lsof', '-p', str(os.getpid())], capture_output=True, text=True, check=False)
+          for line in result.stdout.splitlines():
+              if any(name in line for name in ('_tkinter', 'libtcl', 'libtk', 'Tcl.framework', 'Tk.framework')):
+                  print(line, flush=True)
+          root.destroy()
+          PY_RUNTIME
+          run_trial() {
+            trial="$1"
+            executable="$2"
+            expected="$3"
             cp "$diag/script-sha256.txt" "$diag/$trial-script-sha256.txt"
-            cp "$diag/runtime.txt" "$diag/$trial-runtime.txt"
-            printf '%q ' "$VIRTUAL_ENV/bin/python" -X faulthandler -u "$script" "$mode" > "$diag/$trial-command.txt"
+            if [ -z "$executable" ] || [ ! -x "$executable" ]; then
+              printf 'unavailable: Python executable missing: %s\n' "$executable" > "$diag/$trial-status.txt"
+              return
+            fi
+            set +e
+            "$executable" -c 'import sys; v=sys.version_info; e=sys.argv[1]; ok=(v[:3]==(3,15,2) if e=="3.15.2" else v[:2]==(3,14)) and v.releaselevel=="final"; print(sys.version); sys.exit(0 if ok else 1)' "$expected" > "$diag/$trial-version-check.txt" 2>&1
+            version_status=$?
+            set -e
+            if [ "$version_status" -ne 0 ]; then
+              printf 'unavailable: expected stable Python %s; version check exit %s\n' "$expected" "$version_status" > "$diag/$trial-status.txt"
+              return
+            fi
+            set +e
+            "$executable" -X faulthandler -u "$diag/runtime_probe.py" > "$diag/$trial-runtime.txt" 2>&1
+            probe_status=$?
+            set -e
+            printf '%s\n' "$probe_status" > "$diag/$trial-runtime-exit.txt"
+            printf '%q ' "$executable" -X faulthandler -u "$script" minimum > "$diag/$trial-command.txt"
             printf '\n' >> "$diag/$trial-command.txt"
             set +e
-            "$VIRTUAL_ENV/bin/python" -X faulthandler -u "$script" "$mode" 2>&1 | tee "$diag/$trial-output.log"
+            "$executable" -X faulthandler -u "$script" minimum 2>&1 | tee "$diag/$trial-output.log"
             trial_status=${PIPESTATUS[0]}
             set -e
             printf '%s\n' "$trial_status" > "$diag/$trial-exit.txt"
+            printf 'executed: process exit %s; runtime probe exit %s\n' "$trial_status" "$probe_status" > "$diag/$trial-status.txt"
             printf '%s exit: %s\n' "$trial" "$trial_status"
-          done
+          }
+          u1_python="$VIRTUAL_ENV/bin/python"
+          run_trial U1 "$u1_python" 3.15.2
+          uv_dir="$RUNNER_TEMP/uv-managed-python"
+          set +e
+          env -u VIRTUAL_ENV UV_PYTHON_INSTALL_DIR="$uv_dir" uv python install --no-config 3.15.2 > "$diag/U2-install.log" 2>&1
+          install_status=$?
+          set -e
+          printf '%s\n' "$install_status" > "$diag/U2-install-exit.txt"
+          if [ "$install_status" -eq 0 ]; then
+            set +e
+            u2_python=$(env -u VIRTUAL_ENV UV_PYTHON_INSTALL_DIR="$uv_dir" uv python find --managed-python --no-config 3.15.2 2>> "$diag/U2-install.log")
+            find_status=$?
+            set -e
+            printf '%s\n' "$find_status" > "$diag/U2-find-exit.txt"
+            if [ "$find_status" -eq 0 ]; then
+              printf 'uv managed executable: %s\n' "$u2_python" > "$diag/U2-distribution-check.txt"
+              case "$u2_python" in
+                "$uv_dir"/*) ;;
+                *) printf 'unavailable: uv executable outside isolated install directory\n' > "$diag/U2-status.txt"; u2_python='' ;;
+              esac
+              if [ -n "$u2_python" ]; then
+                set +e
+                u1_tk=$("$u1_python" -c 'import _tkinter, os; print(os.path.realpath(_tkinter.__file__))')
+                u1_tk_status=$?
+                u2_tk=$("$u2_python" -c 'import _tkinter, os; print(os.path.realpath(_tkinter.__file__))')
+                u2_tk_status=$?
+                set -e
+                printf 'U1 _tkinter: %s (exit %s)\nU2 _tkinter: %s (exit %s)\n' "$u1_tk" "$u1_tk_status" "$u2_tk" "$u2_tk_status" >> "$diag/U2-distribution-check.txt"
+                if [ "$u1_tk_status" -ne 0 ] || [ "$u2_tk_status" -ne 0 ]; then
+                  printf 'unavailable: _tkinter binary comparison failed\n' > "$diag/U2-status.txt"
+                elif [ "$u1_tk" = "$u2_tk" ]; then
+                  printf 'unavailable: U2 resolved to U1 _tkinter binary\n' > "$diag/U2-status.txt"
+                else
+                  run_trial U2 "$u2_python" 3.15.2
+                fi
+              fi
+            else
+              printf 'unavailable: uv-managed Python lookup failed\n' > "$diag/U2-status.txt"
+            fi
+          else
+            printf 'unavailable: uv-managed Python install failed\n' > "$diag/U2-status.txt"
+          fi
+          if [ "$PY314_OUTCOME" = success ]; then
+            run_trial U3 "$PY314_PATH" 3.14
+          else
+            printf 'unavailable: setup-python 3.14 outcome %s\n' "$PY314_OUTCOME" > "$diag/U3-status.txt"
+          fi
           git status --short > "$diag/after-status.txt"
           git diff HEAD -- > "$diag/after-tracked.diff"
           test ! -s "$diag/after-tracked.diff"
@@ -136,7 +241,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: macos-python315-tk-standalone-t1-t5
+          name: macos-tk-standalone-u1-u3
           path: ${{ runner.temp }}/amc-tk-diagnostic/
           if-no-files-found: warn
           retention-days: 3
