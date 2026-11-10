@@ -1,4 +1,4 @@
-name: Pytest macOS Tk single-case geometry diagnostic
+name: Pytest macOS Tk window-sizing class geometry diagnostic
 
 on:
   workflow_dispatch:
@@ -84,13 +84,13 @@ jobs:
           root.destroy()
           PY
 
-      - name: Run one instrumented TestWindowSizing case
+      - name: Run instrumented TestWindowSizing class
         shell: bash
         run: |
           set -euo pipefail
           diag="$AMC_TK_DIAG"
           cat > "$RUNNER_TEMP/amc_tk_geometry_probe.py" <<'PY_PLUGIN'
-          """Temporary, bounded Tk geometry trace for one AMC pytest case."""
+          """Temporary, bounded Tk geometry trace for one AMC pytest class."""
 
           import functools
           import json
@@ -103,21 +103,19 @@ jobs:
           from ardupilot_methodic_configurator.frontend_tkinter_parameter_editor import ParameterEditorWindow
 
 
-          TARGET = (
-              "tests/test_frontend_tkinter_parameter_editor.py::TestWindowSizing::"
-              "test_real_component_fields_remain_accessible_after_rebuilding"
-              "[1920x1080-144dpi-fitting-fields-immediate]"
-          )
+          TARGET_PREFIX = "tests/test_frontend_tkinter_parameter_editor.py::TestWindowSizing::"
           FD = os.open(os.environ["AMC_TK_GEOMETRY_TRACE"], os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
           START = time.monotonic_ns()
-          LIMIT = 3000
+          LIMIT = 40000
           count = 0
           omitted = 0
           phase = "initial"
+          nodeid = None
           bindings_exist = False
           editor_seen = None
           root_seen = None
           originals = {}
+          resize_jobs = set()
 
 
           def record(event, **details):
@@ -126,7 +124,8 @@ jobs:
                   omitted += 1
                   return
               row = {"ms": round((time.monotonic_ns() - START) / 1_000_000, 3),
-                     "event": event, "phase": phase, "bindings_exist": bindings_exist, **details}
+                     "event": event, "phase": phase, "nodeid": nodeid,
+                     "bindings_exist": bindings_exist, **details}
               os.write(FD, (json.dumps(row, default=str, separators=(",", ":")) + "\n").encode())
               count += 1
 
@@ -153,29 +152,30 @@ jobs:
 
 
           def pending(where):
-              editor = editor_seen
-              root = root_seen
               jobs = None
-              if root is not None:
+              if root_seen is not None:
                   try:
-                      jobs = root.tk.call("after", "info")
+                      jobs = root_seen.tk.call("after", "info")
                   except tk.TclError:
                       pass
-              record("pending", where=where, resize_job=getattr(editor, "_parameter_area_resize_job", None),
-                     after_jobs=jobs, omitted=omitted)
+              record("pending", where=where,
+                     resize_job=getattr(editor_seen, "_parameter_area_resize_job", None),
+                     tracked_jobs=sorted(resize_jobs), after_jobs=jobs, omitted=omitted)
 
 
           @pytest.hookimpl(hookwrapper=True, tryfirst=True)
           def pytest_runtest_protocol(item, nextitem):
-              global phase, bindings_exist, editor_seen, root_seen
-              if item.nodeid != TARGET:
+              global phase, nodeid, bindings_exist, editor_seen, root_seen
+              if not item.nodeid.startswith(TARGET_PREFIX):
                   yield
                   return
               phase = "protocol"
+              nodeid = item.nodeid
               bindings_exist = False
               editor_seen = None
               root_seen = None
-              record("test_start", nodeid=item.nodeid)
+              resize_jobs.clear()
+              record("test_start")
 
               def wrap(cls, name, factory):
                   original = getattr(cls, name)
@@ -193,7 +193,8 @@ jobs:
                       try:
                           return original(self)
                       finally:
-                          record("update_exit", widget=str(self), ms_elapsed=round((time.monotonic_ns()-start)/1_000_000, 3))
+                          record("update_exit", widget=str(self),
+                                 ms_elapsed=round((time.monotonic_ns() - start) / 1_000_000, 3))
                   return traced
 
               def after_idle_factory(original):
@@ -202,17 +203,29 @@ jobs:
                       relevant = getattr(func, "__name__", "") == "_run_pending_parameter_area_resize"
                       if relevant:
                           record("after_idle_schedule", widget=str(self))
+                      job = None
 
                       @functools.wraps(func)
                       def called(*call_args):
                           if relevant:
-                              record("after_idle_execute", widget=str(self))
+                              resize_jobs.discard(job)
+                              record("after_idle_execute", widget=str(self), job=job)
                           return func(*call_args)
 
                       job = original(self, called, *args)
                       if relevant:
+                          resize_jobs.add(job)
                           record("after_idle_job", job=job)
                       return job
+                  return traced
+
+              def after_cancel_factory(original):
+                  @functools.wraps(original)
+                  def traced(self, job):
+                      if job in resize_jobs:
+                          resize_jobs.discard(job)
+                          record("after_idle_cancel", job=job, widget=str(self))
+                      return original(self, job)
                   return traced
 
               def bind_factory(original):
@@ -230,7 +243,8 @@ jobs:
                   @functools.wraps(original)
                   def traced(self, event):
                       record("configure_callback", widget=str(getattr(event, "widget", "?")),
-                             job=self._parameter_area_resize_job, running=self._parameter_area_resize_running)
+                             job=self._parameter_area_resize_job,
+                             running=self._parameter_area_resize_running)
                       return original(self, event)
                   return traced
 
@@ -242,7 +256,8 @@ jobs:
                       try:
                           return original(self)
                       finally:
-                          record("pending_fit_exit", ms_elapsed=round((time.monotonic_ns()-start)/1_000_000, 3))
+                          record("pending_fit_exit",
+                                 ms_elapsed=round((time.monotonic_ns() - start) / 1_000_000, 3))
                   return traced
 
               def fit_factory(original):
@@ -253,12 +268,14 @@ jobs:
                       try:
                           return original(self)
                       finally:
-                          record("fit_exit", ms_elapsed=round((time.monotonic_ns()-start)/1_000_000, 3),
+                          record("fit_exit",
+                                 ms_elapsed=round((time.monotonic_ns() - start) / 1_000_000, 3),
                                  **geometry(self))
                   return traced
 
               wrap(tk.Misc, "update_idletasks", update_factory)
               wrap(tk.Misc, "after_idle", after_idle_factory)
+              wrap(tk.Misc, "after_cancel", after_cancel_factory)
               wrap(ParameterEditorWindow, "_bind_parameter_layout_events", bind_factory)
               wrap(ParameterEditorWindow, "_on_main_frame_resize", resize_event_factory)
               wrap(ParameterEditorWindow, "_run_pending_parameter_area_resize", pending_factory)
@@ -267,35 +284,34 @@ jobs:
                   yield
               finally:
                   pending("protocol_end")
+                  record("test_end", omitted=omitted)
                   for (cls, name), original in originals.items():
                       setattr(cls, name, original)
-                  record("test_end", omitted=omitted)
-                  os.close(FD)
+                  originals.clear()
+                  nodeid = None
 
 
-          @pytest.hookimpl(tryfirst=True)
-          def pytest_runtest_setup(item):
-              global phase
-              if item.nodeid == TARGET:
-                  phase = "setup"
+          def phase_hook(name):
+              @pytest.hookimpl(hookwrapper=True, tryfirst=True)
+              def hook(item):
+                  global phase
+                  if not item.nodeid.startswith(TARGET_PREFIX):
+                      yield
+                      return
+                  phase = name
+                  start = time.monotonic_ns()
+                  record("phase_start")
+                  outcome = yield
+                  record("phase_end", ms_elapsed=round((time.monotonic_ns() - start) / 1_000_000, 3),
+                         outcome=str(outcome.excinfo[0].__name__) if outcome.excinfo else "ok")
+                  if name == "teardown":
+                      pending("teardown_end")
+              return hook
 
 
-          @pytest.hookimpl(tryfirst=True)
-          def pytest_runtest_call(item):
-              global phase
-              if item.nodeid == TARGET:
-                  phase = "call"
-
-
-          @pytest.hookimpl(hookwrapper=True)
-          def pytest_runtest_teardown(item, nextitem):
-              global phase
-              if item.nodeid != TARGET:
-                  yield
-                  return
-              phase = "teardown"
-              yield
-              pending("teardown_end")
+          pytest_runtest_setup = phase_hook("setup")
+          pytest_runtest_call = phase_hook("call")
+          pytest_runtest_teardown = phase_hook("teardown")
           PY_PLUGIN
           cat > "$RUNNER_TEMP/amc_tk_watchdog.py" <<'PY_WATCHDOG'
           import json
@@ -326,10 +342,10 @@ jobs:
                           except json.JSONDecodeError:
                               continue
                           event = row.get('event')
-                          if event in ('update_enter', 'fit_enter'):
+                          if event == 'update_enter':
                               open_calls.append((event, time.monotonic(), row))
-                          elif event in ('update_exit', 'fit_exit'):
-                              match = event.replace('_exit', '_enter')
+                          elif event == 'update_exit':
+                              match = 'update_enter'
                               for index in range(len(open_calls) - 1, -1, -1):
                                   if open_calls[index][0] == match:
                                       open_calls.pop(index)
@@ -364,11 +380,11 @@ jobs:
           command -v sample > "$diag/sample-availability-shell.txt" || true
           export PYTHONPATH="$RUNNER_TEMP${PYTHONPATH:+:$PYTHONPATH}"
           export AMC_TK_GEOMETRY_TRACE="$diag/geometry-trace.jsonl"
-          node='tests/test_frontend_tkinter_parameter_editor.py::TestWindowSizing::test_real_component_fields_remain_accessible_after_rebuilding[1920x1080-144dpi-fitting-fields-immediate]'
+          node='tests/test_frontend_tkinter_parameter_editor.py::TestWindowSizing'
           printf '%s\n' "$node" > "$diag/test-node.txt"
           PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1 "$VIRTUAL_ENV/bin/python" -m pytest \
             -p amc_tk_geometry_probe "$node" --timeout=30 --timeout-method=thread \
-            -o "cache_dir=$RUNNER_TEMP/amc-tk-pytest-cache" -q > "$diag/pytest.log" 2>&1 &
+            -o "cache_dir=$RUNNER_TEMP/amc-tk-pytest-cache" -vv > "$diag/pytest.log" 2>&1 &
           pytest_pid=$!
           printf 'pytest PID: %s\n' "$pytest_pid" > "$diag/pytest-pid.txt"
           "$VIRTUAL_ENV/bin/python" "$RUNNER_TEMP/amc_tk_watchdog.py" \
@@ -388,7 +404,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: macos-python315-tk-single-case-geometry
+          name: macos-python315-tk-window-sizing-class-geometry
           path: ${{ runner.temp }}/amc-tk-diagnostic/
           if-no-files-found: warn
           retention-days: 3
