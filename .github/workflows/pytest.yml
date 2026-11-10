@@ -1,4 +1,4 @@
-name: Pytest macOS Tk window-sizing class geometry diagnostic
+name: Pytest macOS Tk original-order GUI geometry diagnostic
 
 on:
   workflow_dispatch:
@@ -84,26 +84,33 @@ jobs:
           root.destroy()
           PY
 
-      - name: Run instrumented TestWindowSizing class
+      - name: Run instrumented original-order GUI sequence
         shell: bash
         run: |
           set -euo pipefail
           diag="$AMC_TK_DIAG"
           cat > "$RUNNER_TEMP/amc_tk_geometry_probe.py" <<'PY_PLUGIN'
-          """Temporary, bounded Tk geometry trace for one AMC pytest class."""
+          """Temporary, bounded Tk geometry trace for ordered AMC GUI tests."""
 
           import functools
+          import hashlib
           import json
           import os
           import time
           import tkinter as tk
+          from pathlib import Path
 
           import pytest
 
           from ardupilot_methodic_configurator.frontend_tkinter_parameter_editor import ParameterEditorWindow
 
 
-          TARGET_PREFIX = "tests/test_frontend_tkinter_parameter_editor.py::TestWindowSizing::"
+          FIRST_MODULE = "tests/test_frontend_tkinter_parameter_compare_and_upload.py::"
+          EDITOR_MODULE = "tests/test_frontend_tkinter_parameter_editor.py::"
+          UI_PREFIX = EDITOR_MODULE + "TestParameterEditorUiServices::"
+          SIZING_PREFIX = EDITOR_MODULE + "TestWindowSizing::"
+          EXPECTED_SHA256 = "77e0bd7ab82932c21870cf0ba840043c59ff43f2c733aa341d2e3f911f2f1842"
+          selected_ids = set()
           FD = os.open(os.environ["AMC_TK_GEOMETRY_TRACE"], os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
           START = time.monotonic_ns()
           LIMIT = 40000
@@ -116,6 +123,28 @@ jobs:
           root_seen = None
           originals = {}
           resize_jobs = set()
+
+
+          @pytest.hookimpl(trylast=True)
+          def pytest_collection_modifyitems(config, items):
+              ids = [item.nodeid for item in items]
+              start = next(i for i, value in enumerate(ids) if value.startswith(FIRST_MODULE))
+              end = max(i for i, value in enumerate(ids) if value.startswith(SIZING_PREFIX))
+              chosen = items[start:end + 1]
+              chosen_ids = [item.nodeid for item in chosen]
+              text = "\n".join(chosen_ids) + "\n"
+              Path(os.environ["AMC_TK_SELECTED_IDS"]).write_text(text)
+              valid = (len(chosen) == 106
+                       and sum(value.startswith(FIRST_MODULE) for value in chosen_ids) == 33
+                       and sum(value.startswith(UI_PREFIX) for value in chosen_ids) == 1
+                       and sum(value.startswith(SIZING_PREFIX) for value in chosen_ids) == 72
+                       and all(value.startswith((FIRST_MODULE, UI_PREFIX, SIZING_PREFIX)) for value in chosen_ids)
+                       and hashlib.sha256(text.encode()).hexdigest() == EXPECTED_SHA256)
+              if not valid:
+                  raise pytest.UsageError("original-order GUI selection differs from the validated 106-test sequence")
+              selected_ids.update(chosen_ids)
+              config.hook.pytest_deselected(items=items[:start] + items[end + 1:])
+              items[:] = chosen
 
 
           def record(event, **details):
@@ -166,7 +195,7 @@ jobs:
           @pytest.hookimpl(hookwrapper=True, tryfirst=True)
           def pytest_runtest_protocol(item, nextitem):
               global phase, nodeid, bindings_exist, editor_seen, root_seen
-              if not item.nodeid.startswith(TARGET_PREFIX):
+              if item.nodeid not in selected_ids:
                   yield
                   return
               phase = "protocol"
@@ -295,7 +324,7 @@ jobs:
               @pytest.hookimpl(hookwrapper=True, tryfirst=True)
               def hook(item):
                   global phase
-                  if not item.nodeid.startswith(TARGET_PREFIX):
+                  if item.nodeid not in selected_ids:
                       yield
                       return
                   phase = name
@@ -380,10 +409,10 @@ jobs:
           command -v sample > "$diag/sample-availability-shell.txt" || true
           export PYTHONPATH="$RUNNER_TEMP${PYTHONPATH:+:$PYTHONPATH}"
           export AMC_TK_GEOMETRY_TRACE="$diag/geometry-trace.jsonl"
-          node='tests/test_frontend_tkinter_parameter_editor.py::TestWindowSizing'
-          printf '%s\n' "$node" > "$diag/test-node.txt"
+          export AMC_TK_SELECTED_IDS="$diag/selected-test-ids.txt"
+          printf '%s\n' 'Normal collection; plugin validates and selects the 106-test contiguous GUI sequence.' > "$diag/selection-plan.txt"
           PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1 "$VIRTUAL_ENV/bin/python" -m pytest \
-            -p amc_tk_geometry_probe "$node" --timeout=30 --timeout-method=thread \
+            -p amc_tk_geometry_probe --timeout=30 --timeout-method=thread \
             -o "cache_dir=$RUNNER_TEMP/amc-tk-pytest-cache" -vv > "$diag/pytest.log" 2>&1 &
           pytest_pid=$!
           printf 'pytest PID: %s\n' "$pytest_pid" > "$diag/pytest-pid.txt"
@@ -404,7 +433,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: macos-python315-tk-window-sizing-class-geometry
+          name: macos-python315-tk-original-order-gui-geometry
           path: ${{ runner.temp }}/amc-tk-diagnostic/
           if-no-files-found: warn
           retention-days: 3
