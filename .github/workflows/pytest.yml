@@ -1,4 +1,4 @@
-name: Pytest macOS Tk PairTuple split diagnostic
+name: Pytest macOS Tk PairTuple 23-case split diagnostic
 
 on:
   workflow_dispatch:
@@ -84,7 +84,7 @@ jobs:
           root.destroy()
           PY
 
-      - name: Run conditional PairTuple half trials
+      - name: Run conditional 23-case split trials
         shell: bash
         run: |
           set -euo pipefail
@@ -103,10 +103,11 @@ jobs:
           PAIR = "tests/test_frontend_tkinter_pair_tuple_combobox.py::"
           TARGET = ("tests/test_frontend_tkinter_parameter_editor.py::TestWindowSizing::"
                     "test_user_can_close_editor_with_resize_queued[main-frame]")
+          PARENT_SHA256 = "8cc362abda05cf2fd6308f2cbd24f55b278b09f251d6126686d1a846ca349ed2"
           EXPECTED = {
-              "E": (24, "8cc362abda05cf2fd6308f2cbd24f55b278b09f251d6126686d1a846ca349ed2"),
-              "F": (24, "327c755db0d19412863804668eff898c1923d4e297490e0f14a24b909320a9c8"),
-              "G": (47, "0d3a8cc22d570c0312d7e78492b28c004dfd2c737e1eefd7167bbc404def36d3"),
+              "H": (12, "abc7601b8520717c1cc1f1a59f579499ef518806e42018a8d89868b659463132"),
+              "I": (13, "792be231b35406d49bae4f9bfdf6907dd6dc4b7eee24e6e97ab44f2ad6475a9c"),
+              "J": (24, PARENT_SHA256),
           }
           DIAG = Path(os.environ["AMC_TK_DIAG"])
           TRIAL = os.environ["AMC_TK_TRIAL"]
@@ -124,9 +125,13 @@ jobs:
               if (len(pair) != 46 or len(target) != 1
                       or max(ids.index(item.nodeid) for item in pair) >= ids.index(TARGET)):
                   raise pytest.UsageError("validated PairTupleCombobox order or target changed")
-              groups = {"E": pair[:23] + target,
-                        "F": pair[23:] + target,
-                        "G": pair + target}
+              parent = pair[:23] + target
+              parent_text = "\n".join(item.nodeid for item in parent) + "\n"
+              if hashlib.sha256(parent_text.encode()).hexdigest() != PARENT_SHA256:
+                  raise pytest.UsageError("Trial E predecessor IDs or order changed")
+              groups = {"H": pair[:11] + target,
+                        "I": pair[11:23] + target,
+                        "J": parent}
               result = {}
               for name, chosen in groups.items():
                   chosen_ids = [item.nodeid for item in chosen]
@@ -146,9 +151,9 @@ jobs:
               global FD
               groups, manifest = selection(items)
               path = DIAG / "selection-manifest.json"
-              if TRIAL == "E":
+              if TRIAL == "H":
                   path.write_text(json.dumps(manifest, indent=2) + "\n")
-              elif TRIAL not in ("F", "G") or json.loads(path.read_text()) != manifest:
+              elif TRIAL not in ("I", "J") or json.loads(path.read_text()) != manifest:
                   raise pytest.UsageError("trial selection differs from first collection")
               chosen = groups[TRIAL]
               selected.update(item.nodeid for item in chosen)
@@ -217,23 +222,23 @@ jobs:
             printf 'pytest exit: %s\n' "$trial_status" > "$diag/$trial-exit.txt"
             printf 'Trial %s pytest exit: %s\n' "$trial" "$trial_status"
           }
-          run_trial E
+          run_trial H
           if [ "$trial_status" -eq 0 ]; then
-            run_trial F
+            run_trial I
             if [ "$trial_status" -eq 0 ]; then
-              run_trial G
+              run_trial J
             else
-              printf 'Trial G skipped because Trial F exited %s\n' "$trial_status" > "$diag/G-skipped.txt"
+              printf 'Trial J skipped because Trial I exited %s\n' "$trial_status" > "$diag/J-skipped.txt"
             fi
           else
-            printf 'Trials F and G skipped because Trial E exited %s\n' "$trial_status" > "$diag/F-and-G-skipped.txt"
+            printf 'Trials I and J skipped because Trial H exited %s\n' "$trial_status" > "$diag/I-and-J-skipped.txt"
           fi
 
       - name: Upload Tk diagnostic evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: macos-python315-tk-pairtuple-split
+          name: macos-python315-tk-pairtuple-23-split
           path: ${{ runner.temp }}/amc-tk-diagnostic/
           if-no-files-found: warn
           retention-days: 3
