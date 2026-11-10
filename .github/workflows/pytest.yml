@@ -1,4 +1,4 @@
-name: Pytest macOS Tk bare-root lifecycle diagnostic
+name: Standalone macOS Tk root idle diagnostic
 
 on:
   workflow_dispatch:
@@ -84,120 +84,33 @@ jobs:
           root.destroy()
           PY
 
-      - name: Run Trial R bare-root lifecycle control
+      - name: Run standalone Tk trials S1 and S2
         shell: bash
         run: |
           set -euo pipefail
           diag="$AMC_TK_DIAG"
-          cat > "$RUNNER_TEMP/amc_tk_order_probe.py" <<'PY_PLUGIN'
-          """Temporary pytest selection and phase trace; does not patch Tk."""
-
-          import hashlib
-          import json
-          import os
-          import time
-          from pathlib import Path
-
-          import pytest
-
-          BARE = "tests/test_amc_tk_bare_root_diagnostic.py::test_bare_tk_root_lifecycle"
-          TARGET = ("tests/test_frontend_tkinter_parameter_editor.py::TestWindowSizing::"
-                    "test_user_can_close_editor_with_resize_queued[main-frame]")
-          EXPECTED_COUNT = 2
-          EXPECTED_SHA256 = "11c0fed81b120f5712a6a8178fbd4cc09122b12b9f3297ec6152c5566eed2b9e"
-          DIAG = Path(os.environ["AMC_TK_DIAG"])
-          START = time.monotonic_ns()
-          FD = None
-          selected = set()
-          current = None
-          phase = "initial"
-
-
-          def selection(items):
-              bare = [item for item in items if item.nodeid == BARE]
-              target = [item for item in items if item.nodeid == TARGET]
-              if len(bare) != 1 or len(target) != 1:
-                  raise pytest.UsageError("bare-root or sizing case missing or duplicated")
-              if items.index(bare[0]) >= items.index(target[0]):
-                  raise pytest.UsageError("bare-root test did not collect before sizing case")
-              chosen = bare + target
-              chosen_ids = [item.nodeid for item in chosen]
-              text = "\n".join(chosen_ids) + "\n"
-              digest = hashlib.sha256(text.encode()).hexdigest()
-              if (len(chosen_ids), digest) != (EXPECTED_COUNT, EXPECTED_SHA256):
-                  raise pytest.UsageError("Trial R IDs, count or hash changed")
-              if chosen_ids != [BARE, TARGET]:
-                  raise pytest.UsageError("Trial R selected unexpected test IDs")
-              (DIAG / "R-selected-test-ids.txt").write_text(text)
-              manifest = {"count": len(chosen_ids), "sha256": digest,
-                          "first": chosen_ids[0], "last": chosen_ids[-1]}
-              (DIAG / "R-selection-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-              return chosen
-
-
-          @pytest.hookimpl(trylast=True)
-          def pytest_collection_modifyitems(config, items):
-              global FD
-              chosen = selection(items)
-              selected.update(item.nodeid for item in chosen)
-              excluded = [item for item in items if item.nodeid not in selected]
-              config.hook.pytest_deselected(items=excluded)
-              items[:] = chosen
-              FD = os.open(DIAG / "R-phase-trace.jsonl",
-                           os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
-
-
-          def record(event, **details):
-              if FD is None:
-                  return
-              row = {"ms": round((time.monotonic_ns() - START) / 1_000_000, 3),
-                     "event": event, "nodeid": current, "phase": phase, **details}
-              os.write(FD, (json.dumps(row, separators=(",", ":")) + "\n").encode())
-
-
-          @pytest.hookimpl(hookwrapper=True, tryfirst=True)
-          def pytest_runtest_protocol(item, nextitem):
-              global current, phase
-              if item.nodeid not in selected:
-                  yield
-                  return
-              current, phase = item.nodeid, "protocol"
-              record("test_start")
-              yield
-              record("test_end")
-              current = None
-
-
-          def phase_hook(name):
-              @pytest.hookimpl(hookwrapper=True, tryfirst=True)
-              def hook(item):
-                  global phase
-                  if item.nodeid not in selected:
-                      yield
-                      return
-                  phase = name
-                  start = time.monotonic_ns()
-                  record("phase_start")
-                  outcome = yield
-                  record("phase_end",
-                         ms_elapsed=round((time.monotonic_ns() - start) / 1_000_000, 3),
-                         outcome=(outcome.excinfo[0].__name__ if outcome.excinfo else "ok"))
-              return hook
-
-
-          pytest_runtest_setup = phase_hook("setup")
-          pytest_runtest_call = phase_hook("call")
-          pytest_runtest_teardown = phase_hook("teardown")
-          PY_PLUGIN
-          export PYTHONPATH="$RUNNER_TEMP${PYTHONPATH:+:$PYTHONPATH}"
+          script="diagnostics/tk_root_idle_reproducer.py"
+          test -f "$script"
+          cp "$script" "$diag/tk_root_idle_reproducer.py"
+          shasum -a 256 "$script" > "$diag/script-sha256.txt"
           export PYTHONFAULTHANDLER=1
           export PYTHONUNBUFFERED=1
-          check_checkout() {
-            label="$1"
-            git status --short > "$diag/$label-status.txt"
-            git diff HEAD -- > "$diag/$label-tracked.diff"
-            test ! -s "$diag/$label-tracked.diff"
-            python - "$diag/$label-untracked.txt" <<'PY_CHECK'
+          for mode in control prior-root; do
+            if [ "$mode" = control ]; then trial=S1; else trial=S2; fi
+            cp "$diag/script-sha256.txt" "$diag/$trial-script-sha256.txt"
+            printf '%q ' "$VIRTUAL_ENV/bin/python" -X faulthandler -u "$script" "$mode" > "$diag/$trial-command.txt"
+            printf '\n' >> "$diag/$trial-command.txt"
+            set +e
+            "$VIRTUAL_ENV/bin/python" -X faulthandler -u "$script" "$mode" 2>&1 | tee "$diag/$trial-output.log"
+            trial_status=${PIPESTATUS[0]}
+            set -e
+            printf '%s\n' "$trial_status" > "$diag/$trial-exit.txt"
+            printf '%s exit: %s\n' "$trial" "$trial_status"
+          done
+          git status --short > "$diag/after-status.txt"
+          git diff HEAD -- > "$diag/after-tracked.diff"
+          test ! -s "$diag/after-tracked.diff"
+          python - "$diag/after-untracked.txt" <<'PY_CHECK'
           import subprocess
           import sys
           from pathlib import Path
@@ -211,42 +124,12 @@ jobs:
           if unexpected:
               raise SystemExit(f"unexpected untracked paths: {sorted(unexpected)}")
           PY_CHECK
-          }
-          check_checkout before
-          temporary_test="tests/test_amc_tk_bare_root_diagnostic.py"
-          test ! -e "$temporary_test"
-          trap 'rm -f "$temporary_test"' EXIT
-          cat > "$temporary_test" <<'PY_BARE'
-          import tkinter as tk
-
-
-          def test_bare_tk_root_lifecycle():
-              root = tk.Tk()
-              try:
-                  pass
-              finally:
-                  root.destroy()
-          PY_BARE
-          cp "$temporary_test" "$diag/R-temporary-test.py"
-          set +e
-          "$VIRTUAL_ENV/bin/python" -X faulthandler -m pytest -p amc_tk_order_probe \
-            --timeout=30 --timeout-method=thread \
-            -o "cache_dir=$RUNNER_TEMP/amc-tk-pytest-cache" -vv 2>&1 \
-            | tee "$diag/R-pytest.log"
-          trial_status=${PIPESTATUS[0]}
-          set -e
-          printf 'pytest exit: %s\n' "$trial_status" > "$diag/R-exit.txt"
-          printf 'Trial R pytest exit: %s\n' "$trial_status"
-          rm -f "$temporary_test"
-          test ! -e "$temporary_test"
-          trap - EXIT
-          check_checkout after
 
       - name: Upload Tk diagnostic evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: macos-python315-tk-trial-r-bare-root
+          name: macos-python315-tk-standalone-s1-s2
           path: ${{ runner.temp }}/amc-tk-diagnostic/
           if-no-files-found: warn
           retention-days: 3
