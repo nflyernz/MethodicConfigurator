@@ -1,4 +1,4 @@
-name: Pytest macOS Tk initialization control diagnostic
+name: Pytest macOS Tk isolated sizing diagnostic
 
 on:
   workflow_dispatch:
@@ -84,7 +84,7 @@ jobs:
           root.destroy()
           PY
 
-      - name: Run Trial P initialization control
+      - name: Run Trial Q isolated sizing case
         shell: bash
         run: |
           set -euo pipefail
@@ -100,13 +100,10 @@ jobs:
 
           import pytest
 
-          PAIR = "tests/test_frontend_tkinter_pair_tuple_combobox.py::"
-          INITIALIZATION = PAIR + "TestPairTupleComboboxTooltip::test_initialization"
           TARGET = ("tests/test_frontend_tkinter_parameter_editor.py::TestWindowSizing::"
                     "test_user_can_close_editor_with_resize_queued[main-frame]")
-          PARENT_SHA256 = "abc7601b8520717c1cc1f1a59f579499ef518806e42018a8d89868b659463132"
-          EXPECTED_COUNT = 2
-          EXPECTED_SHA256 = "81dd7b605919868ea40201c81035dd4c4acbba31c27095c8c706a2c0e664bd22"
+          EXPECTED_COUNT = 1
+          EXPECTED_SHA256 = "87f4f7a444ce588537d5ac604cd5433e5e003720d333437371e1fac90ab7e407"
           DIAG = Path(os.environ["AMC_TK_DIAG"])
           START = time.monotonic_ns()
           FD = None
@@ -116,30 +113,21 @@ jobs:
 
 
           def selection(items):
-              ids = [item.nodeid for item in items]
-              pair = [item for item in items if item.nodeid.startswith(PAIR)]
               target = [item for item in items if item.nodeid == TARGET]
-              if (len(pair) != 46 or len(target) != 1
-                      or max(ids.index(item.nodeid) for item in pair) >= ids.index(TARGET)):
-                  raise pytest.UsageError("validated PairTupleCombobox order or target changed")
-              parent = pair[:11] + target
-              parent_text = "\n".join(item.nodeid for item in parent) + "\n"
-              if hashlib.sha256(parent_text.encode()).hexdigest() != PARENT_SHA256:
-                  raise pytest.UsageError("Trial H predecessor IDs or order changed")
-              if pair[5].nodeid != INITIALIZATION:
-                  raise pytest.UsageError("initialization test moved in collection")
-              chosen = [pair[5]] + target
+              if len(target) != 1:
+                  raise pytest.UsageError("target sizing case missing or duplicated")
+              chosen = target
               chosen_ids = [item.nodeid for item in chosen]
               text = "\n".join(chosen_ids) + "\n"
               digest = hashlib.sha256(text.encode()).hexdigest()
               if (len(chosen_ids), digest) != (EXPECTED_COUNT, EXPECTED_SHA256):
-                  raise pytest.UsageError("Trial P IDs, count or order changed")
-              if chosen_ids != [INITIALIZATION, TARGET]:
-                  raise pytest.UsageError("Trial P selected unexpected test IDs")
-              (DIAG / "P-selected-test-ids.txt").write_text(text)
+                  raise pytest.UsageError("Trial Q ID, count or hash changed")
+              if chosen_ids != [TARGET]:
+                  raise pytest.UsageError("Trial Q selected an unexpected test ID")
+              (DIAG / "Q-selected-test-ids.txt").write_text(text)
               manifest = {"count": len(chosen_ids), "sha256": digest,
                           "first": chosen_ids[0], "last": chosen_ids[-1]}
-              (DIAG / "P-selection-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+              (DIAG / "Q-selection-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
               return chosen
 
 
@@ -151,7 +139,7 @@ jobs:
               excluded = [item for item in items if item.nodeid not in selected]
               config.hook.pytest_deselected(items=excluded)
               items[:] = chosen
-              FD = os.open(DIAG / "P-phase-trace.jsonl",
+              FD = os.open(DIAG / "Q-phase-trace.jsonl",
                            os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
 
 
@@ -225,18 +213,18 @@ jobs:
           "$VIRTUAL_ENV/bin/python" -X faulthandler -m pytest -p amc_tk_order_probe \
             --timeout=30 --timeout-method=thread \
             -o "cache_dir=$RUNNER_TEMP/amc-tk-pytest-cache" -vv 2>&1 \
-            | tee "$diag/P-pytest.log"
+            | tee "$diag/Q-pytest.log"
           trial_status=${PIPESTATUS[0]}
           set -e
-          printf 'pytest exit: %s\n' "$trial_status" > "$diag/P-exit.txt"
-          printf 'Trial P pytest exit: %s\n' "$trial_status"
+          printf 'pytest exit: %s\n' "$trial_status" > "$diag/Q-exit.txt"
+          printf 'Trial Q pytest exit: %s\n' "$trial_status"
           check_checkout after
 
       - name: Upload Tk diagnostic evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: macos-python315-tk-trial-p-initialization
+          name: macos-python315-tk-trial-q-isolated-sizing
           path: ${{ runner.temp }}/amc-tk-diagnostic/
           if-no-files-found: warn
           retention-days: 3
