@@ -1,4 +1,4 @@
-name: Pytest macOS Tk PairTuple ordered geometry diagnostic
+name: Pytest macOS Tk unwrapped-predecessor diagnostic
 
 on:
   workflow_dispatch:
@@ -84,7 +84,7 @@ jobs:
           root.destroy()
           PY
 
-      - name: Run instrumented PairTuple-to-window-sizing sequence
+      - name: Run unwrapped predecessors then instrumented window sizing
         shell: bash
         run: |
           set -euo pipefail
@@ -125,7 +125,6 @@ jobs:
           root_seen = None
           originals = {}
           resize_jobs = set()
-          live_roots = set()
 
 
           @pytest.hookimpl(trylast=True)
@@ -195,8 +194,7 @@ jobs:
                       pass
               record("pending", where=where,
                      resize_job=getattr(editor_seen, "_parameter_area_resize_job", None),
-                     tracked_jobs=sorted(resize_jobs), after_jobs=jobs,
-                     live_roots=len(live_roots), omitted=omitted)
+                     tracked_jobs=sorted(resize_jobs), after_jobs=jobs, omitted=omitted)
 
 
           @pytest.hookimpl(hookwrapper=True, tryfirst=True)
@@ -212,39 +210,12 @@ jobs:
               root_seen = None
               resize_jobs.clear()
               record("test_start")
+              instrument_geometry = item.nodeid.startswith(SIZING_PREFIX)
 
               def wrap(cls, name, factory):
                   original = getattr(cls, name)
                   originals[(cls, name)] = original
                   setattr(cls, name, factory(original))
-
-              def root_init_factory(original):
-                  @functools.wraps(original)
-                  def traced(self, *args, **kwargs):
-                      global root_seen
-                      result = original(self, *args, **kwargs)
-                      root_seen = self
-                      live_roots.add(id(self))
-                      record("root_created", root_id=id(self), live_roots=len(live_roots))
-                      return result
-                  return traced
-
-              def root_destroy_factory(original):
-                  @functools.wraps(original)
-                  def traced(self):
-                      root_id = id(self)
-                      try:
-                          jobs = self.tk.call("after", "info")
-                      except tk.TclError:
-                          jobs = None
-                      record("root_destroy_enter", root_id=root_id,
-                             live_roots=len(live_roots), after_jobs=jobs)
-                      try:
-                          return original(self)
-                      finally:
-                          live_roots.discard(root_id)
-                          record("root_destroy_exit", root_id=root_id, live_roots=len(live_roots))
-                  return traced
 
               def update_factory(original):
                   @functools.wraps(original)
@@ -337,19 +308,19 @@ jobs:
                                  **geometry(self))
                   return traced
 
-              wrap(tk.Tk, "__init__", root_init_factory)
-              wrap(tk.Tk, "destroy", root_destroy_factory)
-              wrap(tk.Misc, "update_idletasks", update_factory)
-              wrap(tk.Misc, "after_idle", after_idle_factory)
-              wrap(tk.Misc, "after_cancel", after_cancel_factory)
-              wrap(ParameterEditorWindow, "_bind_parameter_layout_events", bind_factory)
-              wrap(ParameterEditorWindow, "_on_main_frame_resize", resize_event_factory)
-              wrap(ParameterEditorWindow, "_run_pending_parameter_area_resize", pending_factory)
-              wrap(ParameterEditorWindow, "_resize_parameter_area_to_fit", fit_factory)
+              if instrument_geometry:
+                  wrap(tk.Misc, "update_idletasks", update_factory)
+                  wrap(tk.Misc, "after_idle", after_idle_factory)
+                  wrap(tk.Misc, "after_cancel", after_cancel_factory)
+                  wrap(ParameterEditorWindow, "_bind_parameter_layout_events", bind_factory)
+                  wrap(ParameterEditorWindow, "_on_main_frame_resize", resize_event_factory)
+                  wrap(ParameterEditorWindow, "_run_pending_parameter_area_resize", pending_factory)
+                  wrap(ParameterEditorWindow, "_resize_parameter_area_to_fit", fit_factory)
               try:
                   yield
               finally:
-                  pending("protocol_end")
+                  if instrument_geometry:
+                      pending("protocol_end")
                   record("test_end", omitted=omitted)
                   for (cls, name), original in originals.items():
                       setattr(cls, name, original)
@@ -370,7 +341,7 @@ jobs:
                   outcome = yield
                   record("phase_end", ms_elapsed=round((time.monotonic_ns() - start) / 1_000_000, 3),
                          outcome=str(outcome.excinfo[0].__name__) if outcome.excinfo else "ok")
-                  if name == "teardown":
+                  if name == "teardown" and item.nodeid.startswith(SIZING_PREFIX):
                       pending("teardown_end")
               return hook
 
@@ -470,7 +441,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: macos-python315-tk-pair-tuple-ordered-geometry
+          name: macos-python315-tk-unwrapped-predecessors
           path: ${{ runner.temp }}/amc-tk-diagnostic/
           if-no-files-found: warn
           retention-days: 3
