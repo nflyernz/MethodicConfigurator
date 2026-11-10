@@ -1,4 +1,4 @@
-name: Standalone macOS Tk interpreter lifecycle diagnostic
+name: Standalone macOS Tk showRootWindow fix comparison
 
 on:
   workflow_dispatch:
@@ -7,9 +7,9 @@ permissions:
   contents: read
 
 jobs:
-  pytest:
+  compare:
     runs-on: macos-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Harden the runner (Audit all outbound calls)
         uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
@@ -19,188 +19,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Set up Python on macOS
-        id: macos-python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.15.2'
-
-      - name: Install uv on macOS
+      - name: Install uv
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
-          enable-cache: true
-          cache-dependency-glob: "pyproject.toml"
+          enable-cache: false
 
-      - name: Create macOS virtual environment
+      - name: Build and compare pinned Tk variants
+        shell: bash
         env:
-          MACOS_PYTHON: ${{ steps.macos-python.outputs.python-path }}
-        run: |
-          uv venv --python "$MACOS_PYTHON"
-          echo "UV_PYTHON=$MACOS_PYTHON" >> "$GITHUB_ENV"
-          echo "VIRTUAL_ENV=$GITHUB_WORKSPACE/.venv" >> "$GITHUB_ENV"
-          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+          UV_PYTHON_INSTALL_DIR: ${{ runner.temp }}/amc-uv-python
+          UV_CACHE_DIR: ${{ runner.temp }}/amc-uv-cache
+        run: bash diagnostics/tk_showroot_comparison.sh
 
-      - name: Check Tcl and Tk installed versions
-        run: |
-          python --version
-          python -c "import tkinter; print('Tcl version:', tkinter.TclVersion, 'Tk version:', tkinter.TkVersion)"
-
-      - name: Install dependencies (without project)
-        run: uv sync --no-install-project --extra dev --extra mac_dist
-
-      - name: Install project in editable mode
-        run: uv pip install --python "$VIRTUAL_ENV/bin/python" --editable "." --no-deps
-
-      - name: Record Python and Tcl/Tk runtime
-        shell: bash
-        run: |
-          set -euo pipefail
-          diag="$RUNNER_TEMP/amc-tk-diagnostic"
-          mkdir -p "$diag"
-          echo "AMC_TK_DIAG=$diag" >> "$GITHUB_ENV"
-          python - <<'PY' > "$diag/runtime.txt" 2>&1
-          import _tkinter
-          import os
-          import platform
-          import subprocess
-          import sys
-          import tkinter as tk
-
-          print('platform:', platform.platform(), flush=True)
-          print('python:', sys.version, flush=True)
-          print('executable:', sys.executable, flush=True)
-          print('real executable:', os.path.realpath(sys.executable), flush=True)
-          print('_tkinter:', _tkinter.__file__, flush=True)
-          root = tk.Tk()
-          print('Tcl patchlevel:', root.tk.call('info', 'patchlevel'), flush=True)
-          print('Tk patchlevel:', root.tk.call('package', 'require', 'Tk'), flush=True)
-          print('otool -L _tkinter:', flush=True)
-          subprocess.run(['/usr/bin/otool', '-L', _tkinter.__file__], check=False)
-          print('loaded Tcl/Tk libraries (lsof):', flush=True)
-          result = subprocess.run(['/usr/sbin/lsof', '-p', str(os.getpid())], capture_output=True, text=True, check=False)
-          for line in result.stdout.splitlines():
-              if '_tkinter' in line or 'libtcl' in line or 'libtk' in line or 'Tcl.framework' in line or 'Tk.framework' in line:
-                  print(line, flush=True)
-          root.destroy()
-          PY
-
-      - name: Run standalone Tk interpreter lifecycle trials V1 through V4
-        shell: bash
-        run: |
-          set -euo pipefail
-          diag="$AMC_TK_DIAG"
-          python_script="diagnostics/tk_root_idle_reproducer.py"
-          tcl_script="diagnostics/tk_interp_idle_reproducer.tcl"
-          test -f "$python_script"
-          test -f "$tcl_script"
-          cp "$python_script" "$diag/tk_root_idle_reproducer.py"
-          cp "$tcl_script" "$diag/tk_interp_idle_reproducer.tcl"
-          shasum -a 256 "$python_script" "$tcl_script" > "$diag/script-sha256.txt"
-          printf 'runner architecture: %s\n' "$(uname -m)" > "$diag/runner-architecture.txt"
-          if [ "$(uname -m)" != arm64 ]; then
-            printf 'unavailable: expected macOS arm64 runner\n' > "$diag/runner-status.txt"
-            exit 0
-          fi
-          export PYTHONFAULTHANDLER=1
-          export PYTHONUNBUFFERED=1
-          python_executable="$VIRTUAL_ENV/bin/python"
-          for trial in V1 V2 V3; do
-            case "$trial" in
-              V1) mode=minimum ;;
-              V2) mode=no-withdraw ;;
-              V3) mode=one-interpreter ;;
-            esac
-            cp "$diag/runtime.txt" "$diag/$trial-runtime.txt"
-            shasum -a 256 "$python_script" > "$diag/$trial-script-sha256.txt"
-            printf '%q ' "$python_executable" -X faulthandler -u "$python_script" "$mode" > "$diag/$trial-command.txt"
-            printf '\n' >> "$diag/$trial-command.txt"
-            set +e
-            "$python_executable" -X faulthandler -u "$python_script" "$mode" 2>&1 | tee "$diag/$trial-output.log"
-            trial_status=${PIPESTATUS[0]}
-            set -e
-            printf '%s\n' "$trial_status" > "$diag/$trial-exit.txt"
-            printf 'executed: process exit %s\n' "$trial_status" > "$diag/$trial-status.txt"
-          done
-          cat > "$diag/V4-probe.tcl" <<'TCL_PROBE'
-          puts "Tcl: [info patchlevel]; executable: [info nameofexecutable]"
-          flush stdout
-          if {[info patchlevel] ne "9.0.4"} {exit 2}
-          interp create probe
-          set tk_version [interp eval probe {package require Tk}]
-          puts "Tk: $tk_version; loaded libraries: [interp eval probe {info loaded}]"
-          flush stdout
-          if {$tk_version ne "9.0.5"} {exit 3}
-          interp eval probe {destroy .}
-          interp delete probe
-          TCL_PROBE
-          printf '%s\n' 'V4 deletes the first Tcl slave interpreter; Python V1 retains the first Tk object after destroy(). This is a related lifecycle comparison, not an exact translation.' > "$diag/V4-semantics.txt"
-          shasum -a 256 "$tcl_script" > "$diag/V4-script-sha256.txt"
-          base_prefix=$("$python_executable" -c 'import sys; print(sys.base_prefix)')
-          {
-            find "$base_prefix" -type f -name 'tclsh*' 2>/dev/null || :
-            command -v tclsh9.0 || :
-            command -v tclsh || :
-          } | awk 'NF && !seen[$0]++' > "$diag/V4-candidates.txt"
-          selected_tclsh=''
-          candidate_number=0
-          while IFS= read -r candidate; do
-            candidate_number=$((candidate_number + 1))
-            if [ ! -x "$candidate" ]; then
-              printf 'not executable: %s\n' "$candidate" > "$diag/V4-probe-$candidate_number.log"
-              continue
-            fi
-            set +e
-            "$candidate" "$diag/V4-probe.tcl" > "$diag/V4-probe-$candidate_number.log" 2>&1
-            probe_status=$?
-            set -e
-            printf '%s\n' "$probe_status" > "$diag/V4-probe-$candidate_number-exit.txt"
-            if [ "$probe_status" -eq 0 ]; then
-              selected_tclsh="$candidate"
-              cp "$diag/V4-probe-$candidate_number.log" "$diag/V4-runtime.txt"
-              break
-            fi
-          done < "$diag/V4-candidates.txt"
-          if [ -n "$selected_tclsh" ]; then
-            printf 'selected Tcl executable: %s\n' "$selected_tclsh" >> "$diag/V4-runtime.txt"
-            /usr/bin/otool -L "$selected_tclsh" >> "$diag/V4-runtime.txt" 2>&1 || :
-            printf '%q ' "$selected_tclsh" "$tcl_script" > "$diag/V4-command.txt"
-            printf '\n' >> "$diag/V4-command.txt"
-            set +e
-            { "$selected_tclsh" "$tcl_script"; } 2>&1 | tee "$diag/V4-output.log"
-            v4_status=${PIPESTATUS[0]}
-            set -e
-            printf '%s\n' "$v4_status" > "$diag/V4-exit.txt"
-            printf 'executed: process exit %s\n' "$v4_status" > "$diag/V4-status.txt"
-            report_dir="$HOME/Library/Logs/DiagnosticReports"
-            if [ -d "$report_dir" ]; then
-              find "$report_dir" -maxdepth 1 -type f \( -name 'tclsh*.ips' -o -name 'tclsh*.crash' \) -mmin -5 -exec cp {} "$diag/" \; || :
-            fi
-          else
-            printf 'unavailable: no tclsh candidate loaded Tcl 9.0.4 and Tk 9.0.5 in a slave interpreter\n' > "$diag/V4-status.txt"
-          fi
-          git status --short > "$diag/after-status.txt"
-          git diff HEAD -- > "$diag/after-tracked.diff"
-          test ! -s "$diag/after-tracked.diff"
-          python - "$diag/after-untracked.txt" <<'PY_CHECK'
-          import subprocess
-          import sys
-          from pathlib import Path
-
-          paths = subprocess.check_output(
-              ["git", "ls-files", "--others", "--exclude-standard", "-z"]
-          ).decode().rstrip("\0").split("\0")
-          paths = [path for path in paths if path]
-          Path(sys.argv[1]).write_text("\n".join(paths) + ("\n" if paths else ""))
-          unexpected = set(paths) - {"uv.lock"}
-          if unexpected:
-              raise SystemExit(f"unexpected untracked paths: {sorted(unexpected)}")
-          PY_CHECK
-
-      - name: Upload Tk diagnostic evidence
+      - name: Upload Tk build and crash evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: macos-tk-standalone-v1-v4
-          path: ${{ runner.temp }}/amc-tk-diagnostic/
+          name: macos-tk-showroot-w1-w2
+          path: ${{ runner.temp }}/amc-tk-showroot-comparison/
           if-no-files-found: warn
           retention-days: 3
