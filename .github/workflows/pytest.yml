@@ -1,4 +1,4 @@
-name: Standalone macOS Tk root idle diagnostic
+name: Standalone macOS Tk operation reduction diagnostic
 
 on:
   workflow_dispatch:
@@ -84,7 +84,7 @@ jobs:
           root.destroy()
           PY
 
-      - name: Run standalone Tk trials S1 and S2
+      - name: Run standalone Tk trials T1 through T5
         shell: bash
         run: |
           set -euo pipefail
@@ -95,9 +95,16 @@ jobs:
           shasum -a 256 "$script" > "$diag/script-sha256.txt"
           export PYTHONFAULTHANDLER=1
           export PYTHONUNBUFFERED=1
-          for mode in control prior-root; do
-            if [ "$mode" = control ]; then trial=S1; else trial=S2; fi
+          for trial in T1 T2 T3 T4 T5; do
+            case "$trial" in
+              T1) mode=minimum ;;
+              T2) mode=theme-only ;;
+              T3) mode=dpi-only ;;
+              T4) mode=font-only ;;
+              T5) mode=prior-root ;;
+            esac
             cp "$diag/script-sha256.txt" "$diag/$trial-script-sha256.txt"
+            cp "$diag/runtime.txt" "$diag/$trial-runtime.txt"
             printf '%q ' "$VIRTUAL_ENV/bin/python" -X faulthandler -u "$script" "$mode" > "$diag/$trial-command.txt"
             printf '\n' >> "$diag/$trial-command.txt"
             set +e
@@ -129,7 +136,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: macos-python315-tk-standalone-s1-s2
+          name: macos-python315-tk-standalone-t1-t5
           path: ${{ runner.temp }}/amc-tk-diagnostic/
           if-no-files-found: warn
           retention-days: 3

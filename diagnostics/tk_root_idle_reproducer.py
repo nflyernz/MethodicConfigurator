@@ -62,8 +62,50 @@ def run_control() -> None:
         mark("control: after destroy")
 
 
+def run_reduced(mode: str) -> None:
+    """Vary one layout operation after a bare root lifecycle."""
+    mark("prior-root: before bare Tk()")
+    prior = tk.Tk()
+    mark("prior-root: after bare Tk(); before destroy")
+    prior.destroy()
+    mark("prior-root: after destroy")
+
+    mark("reduced: before second Tk()")
+    root = tk.Tk()
+    mark("reduced: after second Tk()")
+    try:
+        root.withdraw()
+        mark("reduced: after withdraw")
+        if mode == "theme-only":
+            mark("reduced: before alt theme")
+            ttk.Style(root).theme_use("alt")
+            mark("reduced: after alt theme")
+        elif mode == "dpi-only":
+            mark("reduced: before 96-DPI scaling")
+            root.tk.call("tk", "scaling", 96 / 72)
+            mark("reduced: after 96-DPI scaling")
+        elif mode == "font-only":
+            mark("reduced: before named-font configuration")
+            for name in tkfont.names(root):
+                if name.startswith("Tk"):
+                    tkfont.nametofont(name, root=root).configure(family="Arial", size=10)
+            mark("reduced: after named-font configuration")
+        mark("reduced: before update_idletasks")
+        root.update_idletasks()
+        mark("reduced: after update_idletasks")
+    finally:
+        mark("reduced: before destroy")
+        root.destroy()
+        mark("reduced: after destroy")
+
+
 def main() -> None:
     """Run one independently launched diagnostic mode."""
+    if len(sys.argv) == 2 and sys.argv[1] in {"minimum", "theme-only", "dpi-only", "font-only"}:
+        mark(f"mode: {sys.argv[1]}; Python: {sys.version}; executable: {sys.executable}")
+        run_reduced(sys.argv[1])
+        mark("result: completed")
+        return
     if len(sys.argv) != 2 or sys.argv[1] not in {"control", "prior-root"}:
         message = "usage: tk_root_idle_reproducer.py {control|prior-root}"
         raise SystemExit(message)
