@@ -1,4 +1,4 @@
-name: Pytest macOS Tk PairTuple-only diagnostic
+name: Pytest macOS Tk PairTuple split diagnostic
 
 on:
   workflow_dispatch:
@@ -84,7 +84,7 @@ jobs:
           root.destroy()
           PY
 
-      - name: Run PairTuple-only trial with conditional control
+      - name: Run conditional PairTuple half trials
         shell: bash
         run: |
           set -euo pipefail
@@ -101,18 +101,13 @@ jobs:
           import pytest
 
           PAIR = "tests/test_frontend_tkinter_pair_tuple_combobox.py::"
-          APPLICATION = "tests/test_frontend_tkinter_parameter_application.py::"
-          COMPARE = "tests/test_frontend_tkinter_parameter_compare_and_upload.py::"
-          EDITOR = "tests/test_frontend_tkinter_parameter_editor.py::"
-          UI = EDITOR + "TestParameterEditorUiServices::"
-          TARGET = EDITOR + "TestWindowSizing::test_user_can_close_editor_with_resize_queued[main-frame]"
-          COUNTS = {PAIR: 46, APPLICATION: 16, COMPARE: 33, UI: 1, TARGET: 1}
-          GROUPS = {
-              "D": (PAIR, TARGET),
-              "A": (PAIR, COMPARE, UI, TARGET),
+          TARGET = ("tests/test_frontend_tkinter_parameter_editor.py::TestWindowSizing::"
+                    "test_user_can_close_editor_with_resize_queued[main-frame]")
+          EXPECTED = {
+              "E": (24, "8cc362abda05cf2fd6308f2cbd24f55b278b09f251d6126686d1a846ca349ed2"),
+              "F": (24, "327c755db0d19412863804668eff898c1923d4e297490e0f14a24b909320a9c8"),
+              "G": (47, "0d3a8cc22d570c0312d7e78492b28c004dfd2c737e1eefd7167bbc404def36d3"),
           }
-          EXPECTED = {"D": (47, "0d3a8cc22d570c0312d7e78492b28c004dfd2c737e1eefd7167bbc404def36d3"),
-                      "A": (81, "78f9d6ce2dabd3ccef0e9ea580138329f575479a2e7aa86d5b51bb905872163e")}
           DIAG = Path(os.environ["AMC_TK_DIAG"])
           TRIAL = os.environ["AMC_TK_TRIAL"]
           START = time.monotonic_ns()
@@ -122,52 +117,40 @@ jobs:
           phase = "initial"
 
 
-          def matches(nodeid, group):
-              return nodeid == TARGET if group == TARGET else nodeid.startswith(group)
-
-
           def selection(items):
               ids = [item.nodeid for item in items]
-              indices = {group: [i for i, value in enumerate(ids) if matches(value, group)]
-                         for group in COUNTS}
-              if any(len(indices[group]) != count for group, count in COUNTS.items()):
-                  raise pytest.UsageError("GUI module counts or target node ID changed")
-              groups = tuple(COUNTS)
-              if not all(max(indices[left]) < min(indices[right])
-                         for left, right in zip(groups, groups[1:])):
-                  raise pytest.UsageError("original GUI module order changed")
-              first, last = indices[PAIR][0], indices[TARGET][0]
-              if len(ids[first:last + 1]) != 97 or any(
-                      not any(matches(value, group) for group in groups)
-                      for value in ids[first:last + 1]):
-                  raise pytest.UsageError("unexpected tests between PairTupleCombobox and target")
+              pair = [item for item in items if item.nodeid.startswith(PAIR)]
+              target = [item for item in items if item.nodeid == TARGET]
+              if (len(pair) != 46 or len(target) != 1
+                      or max(ids.index(item.nodeid) for item in pair) >= ids.index(TARGET)):
+                  raise pytest.UsageError("validated PairTupleCombobox order or target changed")
+              groups = {"E": pair[:23] + target,
+                        "F": pair[23:] + target,
+                        "G": pair + target}
               result = {}
-              for name, included in GROUPS.items():
-                  chosen = [item for item in items if any(matches(item.nodeid, group)
-                                                            for group in included)]
+              for name, chosen in groups.items():
                   chosen_ids = [item.nodeid for item in chosen]
                   text = "\n".join(chosen_ids) + "\n"
                   digest = hashlib.sha256(text.encode()).hexdigest()
-                  if (len(chosen_ids), digest) != EXPECTED[name]:
+                  if (len(chosen_ids), digest) != EXPECTED[name] or chosen_ids[-1] != TARGET:
                       raise pytest.UsageError(f"trial {name} IDs, count or order changed")
                   (DIAG / f"{name}-selected-test-ids.txt").write_text(text)
                   result[name] = {"count": len(chosen_ids),
                                   "sha256": digest,
                                   "first": chosen_ids[0], "last": chosen_ids[-1]}
-              return result
+              return groups, result
 
 
           @pytest.hookimpl(trylast=True)
           def pytest_collection_modifyitems(config, items):
               global FD
-              manifest = selection(items)
+              groups, manifest = selection(items)
               path = DIAG / "selection-manifest.json"
-              if TRIAL == "D":
+              if TRIAL == "E":
                   path.write_text(json.dumps(manifest, indent=2) + "\n")
-              elif TRIAL != "A" or json.loads(path.read_text()) != manifest:
-                  raise pytest.UsageError("trial selection differs from preflight manifest")
-              chosen = [item for item in items if any(matches(item.nodeid, group)
-                                                        for group in GROUPS[TRIAL])]
+              elif TRIAL not in ("F", "G") or json.loads(path.read_text()) != manifest:
+                  raise pytest.UsageError("trial selection differs from first collection")
+              chosen = groups[TRIAL]
               selected.update(item.nodeid for item in chosen)
               excluded = [item for item in items if item.nodeid not in selected]
               config.hook.pytest_deselected(items=excluded)
@@ -234,18 +217,23 @@ jobs:
             printf 'pytest exit: %s\n' "$trial_status" > "$diag/$trial-exit.txt"
             printf 'Trial %s pytest exit: %s\n' "$trial" "$trial_status"
           }
-          run_trial D
+          run_trial E
           if [ "$trial_status" -eq 0 ]; then
-            run_trial A
+            run_trial F
+            if [ "$trial_status" -eq 0 ]; then
+              run_trial G
+            else
+              printf 'Trial G skipped because Trial F exited %s\n' "$trial_status" > "$diag/G-skipped.txt"
+            fi
           else
-            printf 'Trial A skipped because Trial D exited %s\n' "$trial_status" > "$diag/A-skipped.txt"
+            printf 'Trials F and G skipped because Trial E exited %s\n' "$trial_status" > "$diag/F-and-G-skipped.txt"
           fi
 
       - name: Upload Tk diagnostic evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: macos-python315-tk-pairtuple-only
+          name: macos-python315-tk-pairtuple-split
           path: ${{ runner.temp }}/amc-tk-diagnostic/
           if-no-files-found: warn
           retention-days: 3
