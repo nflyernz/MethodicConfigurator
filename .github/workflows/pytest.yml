@@ -1,4 +1,4 @@
-name: Pytest macOS Tk tooltip isolation diagnostic
+name: Pytest macOS Tk tooltip mock diagnostic
 
 on:
   workflow_dispatch:
@@ -84,7 +84,7 @@ jobs:
           root.destroy()
           PY
 
-      - name: Run conditional tooltip isolation trials
+      - name: Run tooltip mock and root controls
         shell: bash
         run: |
           set -euo pipefail
@@ -106,9 +106,9 @@ jobs:
                     "test_user_can_close_editor_with_resize_queued[main-frame]")
           PARENT_SHA256 = "abc7601b8520717c1cc1f1a59f579499ef518806e42018a8d89868b659463132"
           EXPECTED = {
-              "K": (2, "b55b495945375e7627bb4fb2d2281520e611b7b06446b5c23f056c1425a912d0"),
+              "N": (2, "b55b495945375e7627bb4fb2d2281520e611b7b06446b5c23f056c1425a912d0"),
+              "O": (2, "b55b495945375e7627bb4fb2d2281520e611b7b06446b5c23f056c1425a912d0"),
               "L": (6, "7e3088eb35175598e3085603398f182f9a14b392d27a117863602097d5ab5aef"),
-              "M": (12, PARENT_SHA256),
           }
           DIAG = Path(os.environ["AMC_TK_DIAG"])
           TRIAL = os.environ["AMC_TK_TRIAL"]
@@ -133,9 +133,9 @@ jobs:
               if pair[2].nodeid != SUSPICIOUS:
                   raise pytest.UsageError("suspicious tooltip test moved in collection")
               ordinary = [item for item in pair[:11] if item.nodeid != SUSPICIOUS]
-              groups = {"K": [pair[2]] + target,
-                        "L": ordinary[:5] + target,
-                        "M": parent}
+              groups = {"N": [pair[2]] + target,
+                        "O": [pair[2]] + target,
+                        "L": ordinary[:5] + target}
               result = {}
               for name, chosen in groups.items():
                   chosen_ids = [item.nodeid for item in chosen]
@@ -155,9 +155,9 @@ jobs:
               global FD
               groups, manifest = selection(items)
               path = DIAG / "selection-manifest.json"
-              if TRIAL == "K":
+              if TRIAL == "N":
                   path.write_text(json.dumps(manifest, indent=2) + "\n")
-              elif TRIAL not in ("L", "M") or json.loads(path.read_text()) != manifest:
+              elif TRIAL not in ("O", "L") or json.loads(path.read_text()) != manifest:
                   raise pytest.UsageError("trial selection differs from first collection")
               chosen = groups[TRIAL]
               selected.update(item.nodeid for item in chosen)
@@ -226,23 +226,55 @@ jobs:
             printf 'pytest exit: %s\n' "$trial_status" > "$diag/$trial-exit.txt"
             printf 'Trial %s pytest exit: %s\n' "$trial" "$trial_status"
           }
-          run_trial K
-          if [ "$trial_status" -eq 0 ]; then
-            run_trial L
-            if [ "$trial_status" -eq 0 ]; then
-              run_trial M
-            else
-              printf 'Trial M skipped because Trial L exited %s\n' "$trial_status" > "$diag/M-skipped.txt"
-            fi
-          else
-            printf 'Trials L and M skipped because Trial K exited %s\n' "$trial_status" > "$diag/L-and-M-skipped.txt"
-          fi
+          run_trial N
+          test_file="tests/test_frontend_tkinter_pair_tuple_combobox.py"
+          original="$RUNNER_TEMP/amc-pair-tuple-original.py"
+          cp "$test_file" "$original"
+          shasum -a 256 "$original" > "$diag/O-original-source.sha256"
+          trap 'cp "$original" "$test_file"' EXIT
+          python - <<'PY_EDIT'
+          from pathlib import Path
+
+          path = Path("tests/test_frontend_tkinter_pair_tuple_combobox.py")
+          old = 'patch("tkinter.Toplevel", side_effect=tk.TclError("Test error"))'
+          new = ('patch("ardupilot_methodic_configurator.'
+                 'frontend_tkinter_pair_tuple_combobox.Toplevel", '
+                 'side_effect=tk.TclError("Test error"))')
+          content = path.read_text()
+          if content.count(old) != 1:
+              raise SystemExit("expected exactly one misplaced Toplevel mock")
+          path.write_text(content.replace(old, new))
+          PY_EDIT
+          git diff --check
+          git diff -- "$test_file" > "$diag/O-temporary-source.diff"
+          python - <<'PY_VERIFY'
+          from pathlib import Path
+          import subprocess
+
+          path = Path("tests/test_frontend_tkinter_pair_tuple_combobox.py")
+          original = Path(__import__("os").environ["RUNNER_TEMP"]) / "amc-pair-tuple-original.py"
+          old = 'patch("tkinter.Toplevel", side_effect=tk.TclError("Test error"))'
+          new = ('patch("ardupilot_methodic_configurator.'
+                 'frontend_tkinter_pair_tuple_combobox.Toplevel", '
+                 'side_effect=tk.TclError("Test error"))')
+          assert path.read_text() == original.read_text().replace(old, new)
+          assert subprocess.check_output(["git", "diff", "--name-only"], text=True).splitlines() == [str(path)]
+          PY_VERIFY
+          run_trial O
+          cp "$original" "$test_file"
+          cmp "$original" "$test_file"
+          git diff --exit-code -- "$test_file" > "$diag/O-restored-diff.txt"
+          git status --short > "$diag/O-restored-status.txt"
+          test ! -s "$diag/O-restored-status.txt"
+          printf 'original test file restored; checkout clean\n' > "$diag/O-restore-confirmation.txt"
+          trap - EXIT
+          run_trial L
 
       - name: Upload Tk diagnostic evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: macos-python315-tk-tooltip-isolation
+          name: macos-python315-tk-tooltip-mock-controls
           path: ${{ runner.temp }}/amc-tk-diagnostic/
           if-no-files-found: warn
           retention-days: 3
