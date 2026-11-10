@@ -84,265 +84,139 @@ jobs:
           root.destroy()
           PY
 
-      - name: Run unwrapped predecessors then instrumented window sizing
+      - name: Run three original-order module selections
         shell: bash
         run: |
           set -euo pipefail
           diag="$AMC_TK_DIAG"
-          cat > "$RUNNER_TEMP/amc_tk_geometry_probe.py" <<'PY_PLUGIN'
-          """Temporary, bounded Tk geometry trace for ordered AMC GUI tests."""
+          cat > "$RUNNER_TEMP/amc_tk_order_probe.py" <<'PY_PLUGIN'
+          """Temporary pytest selection and phase trace; does not patch Tk."""
 
-          import functools
           import hashlib
           import json
           import os
           import time
-          import tkinter as tk
           from pathlib import Path
 
           import pytest
 
-          from ardupilot_methodic_configurator.frontend_tkinter_parameter_editor import ParameterEditorWindow
-
-
-          FIRST_MODULE = "tests/test_frontend_tkinter_pair_tuple_combobox.py::"
-          APPLICATION_PREFIX = "tests/test_frontend_tkinter_parameter_application.py::"
-          COMPARE_PREFIX = "tests/test_frontend_tkinter_parameter_compare_and_upload.py::"
-          EDITOR_MODULE = "tests/test_frontend_tkinter_parameter_editor.py::"
-          UI_PREFIX = EDITOR_MODULE + "TestParameterEditorUiServices::"
-          SIZING_PREFIX = EDITOR_MODULE + "TestWindowSizing::"
-          EXPECTED_SHA256 = "ed844713bfae3d53d19420faae4aab5b7c3f09e4a921e7fd533964a2fcff6a0e"
-          selected_ids = set()
-          FD = os.open(os.environ["AMC_TK_GEOMETRY_TRACE"], os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+          PAIR = "tests/test_frontend_tkinter_pair_tuple_combobox.py::"
+          APPLICATION = "tests/test_frontend_tkinter_parameter_application.py::"
+          COMPARE = "tests/test_frontend_tkinter_parameter_compare_and_upload.py::"
+          EDITOR = "tests/test_frontend_tkinter_parameter_editor.py::"
+          UI = EDITOR + "TestParameterEditorUiServices::"
+          TARGET = EDITOR + "TestWindowSizing::test_user_can_close_editor_with_resize_queued[main-frame]"
+          COUNTS = {PAIR: 46, APPLICATION: 16, COMPARE: 33, UI: 1, TARGET: 1}
+          GROUPS = {
+              "A": (PAIR, COMPARE, UI, TARGET),
+              "B": (APPLICATION, COMPARE, UI, TARGET),
+              "C": (PAIR, APPLICATION, COMPARE, UI, TARGET),
+          }
+          EXPECTED = {"A": 81, "B": 51, "C": 97}
+          DIAG = Path(os.environ["AMC_TK_DIAG"])
+          TRIAL = os.environ["AMC_TK_TRIAL"]
           START = time.monotonic_ns()
-          LIMIT = 40000
-          count = 0
-          omitted = 0
+          FD = None
+          selected = set()
+          current = None
           phase = "initial"
-          nodeid = None
-          bindings_exist = False
-          editor_seen = None
-          root_seen = None
-          originals = {}
-          resize_jobs = set()
+
+
+          def matches(nodeid, group):
+              return nodeid == TARGET if group == TARGET else nodeid.startswith(group)
+
+
+          def selection(items):
+              ids = [item.nodeid for item in items]
+              indices = {group: [i for i, value in enumerate(ids) if matches(value, group)]
+                         for group in COUNTS}
+              if any(len(indices[group]) != count for group, count in COUNTS.items()):
+                  raise pytest.UsageError("GUI module counts or target node ID changed")
+              groups = tuple(COUNTS)
+              if not all(max(indices[left]) < min(indices[right])
+                         for left, right in zip(groups, groups[1:])):
+                  raise pytest.UsageError("original GUI module order changed")
+              first, last = indices[PAIR][0], indices[TARGET][0]
+              if len(ids[first:last + 1]) != 97 or any(
+                      not any(matches(value, group) for group in groups)
+                      for value in ids[first:last + 1]):
+                  raise pytest.UsageError("unexpected tests between PairTupleCombobox and target")
+              result = {}
+              for name, included in GROUPS.items():
+                  chosen = [item for item in items if any(matches(item.nodeid, group)
+                                                            for group in included)]
+                  chosen_ids = [item.nodeid for item in chosen]
+                  if len(chosen_ids) != EXPECTED[name]:
+                      raise pytest.UsageError(f"trial {name} count changed")
+                  text = "\n".join(chosen_ids) + "\n"
+                  (DIAG / f"{name}-selected-test-ids.txt").write_text(text)
+                  result[name] = {"count": len(chosen_ids),
+                                  "sha256": hashlib.sha256(text.encode()).hexdigest(),
+                                  "first": chosen_ids[0], "last": chosen_ids[-1]}
+              return result
 
 
           @pytest.hookimpl(trylast=True)
           def pytest_collection_modifyitems(config, items):
-              ids = [item.nodeid for item in items]
-              start = next(i for i, value in enumerate(ids) if value.startswith(FIRST_MODULE))
-              end = max(i for i, value in enumerate(ids) if value.startswith(SIZING_PREFIX))
-              chosen = items[start:end + 1]
-              chosen_ids = [item.nodeid for item in chosen]
-              text = "\n".join(chosen_ids) + "\n"
-              Path(os.environ["AMC_TK_SELECTED_IDS"]).write_text(text)
-              valid = (len(chosen) == 168
-                       and sum(value.startswith(FIRST_MODULE) for value in chosen_ids) == 46
-                       and sum(value.startswith(APPLICATION_PREFIX) for value in chosen_ids) == 16
-                       and sum(value.startswith(COMPARE_PREFIX) for value in chosen_ids) == 33
-                       and sum(value.startswith(UI_PREFIX) for value in chosen_ids) == 1
-                       and sum(value.startswith(SIZING_PREFIX) for value in chosen_ids) == 72
-                       and all(value.startswith((FIRST_MODULE, APPLICATION_PREFIX, COMPARE_PREFIX,
-                                                 UI_PREFIX, SIZING_PREFIX)) for value in chosen_ids)
-                       and hashlib.sha256(text.encode()).hexdigest() == EXPECTED_SHA256)
-              if not valid:
-                  raise pytest.UsageError("original-order GUI selection differs from the validated 168-test sequence")
-              selected_ids.update(chosen_ids)
-              config.hook.pytest_deselected(items=items[:start] + items[end + 1:])
+              global FD
+              manifest = selection(items)
+              path = DIAG / "selection-manifest.json"
+              if TRIAL == "PLAN":
+                  path.write_text(json.dumps(manifest, indent=2) + "\n")
+                  chosen = [item for item in items if any(matches(item.nodeid, group)
+                                                            for group in GROUPS["C"])]
+                  chosen_ids = {item.nodeid for item in chosen}
+                  config.hook.pytest_deselected(
+                      items=[item for item in items if item.nodeid not in chosen_ids])
+                  items[:] = chosen
+                  return
+              if TRIAL not in GROUPS or json.loads(path.read_text()) != manifest:
+                  raise pytest.UsageError("trial selection differs from preflight manifest")
+              chosen = [item for item in items if any(matches(item.nodeid, group)
+                                                        for group in GROUPS[TRIAL])]
+              selected.update(item.nodeid for item in chosen)
+              excluded = [item for item in items if item.nodeid not in selected]
+              config.hook.pytest_deselected(items=excluded)
               items[:] = chosen
+              FD = os.open(DIAG / f"{TRIAL}-phase-trace.jsonl",
+                           os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
 
 
           def record(event, **details):
-              global count, omitted
-              if count >= LIMIT:
-                  omitted += 1
+              if FD is None:
                   return
               row = {"ms": round((time.monotonic_ns() - START) / 1_000_000, 3),
-                     "event": event, "phase": phase, "nodeid": nodeid,
-                     "bindings_exist": bindings_exist, **details}
-              os.write(FD, (json.dumps(row, default=str, separators=(",", ":")) + "\n").encode())
-              count += 1
-
-
-          def geometry(editor):
-              def value(widget, method, *args):
-                  try:
-                      return getattr(widget, method)(*args)
-                  except (AttributeError, tk.TclError):
-                      return None
-
-              area = getattr(editor, "parameter_area_container", None)
-              scroll = getattr(editor, "inline_component_scroll_frame", None)
-              canvas = getattr(scroll, "canvas", None)
-              panel = getattr(editor, "inline_component_container", None)
-              return {"area_cfg": value(area, "cget", "height"),
-                      "area_actual": value(area, "winfo_height"),
-                      "canvas_cfg": value(canvas, "cget", "height"),
-                      "canvas_actual": value(canvas, "winfo_height"),
-                      "panel_cfg": value(panel, "cget", "height"),
-                      "panel_actual": value(panel, "winfo_height"),
-                      "viewport_req": value(getattr(scroll, "view_port", None), "winfo_reqheight"),
-                      "job": getattr(editor, "_parameter_area_resize_job", None)}
-
-
-          def pending(where):
-              jobs = None
-              if root_seen is not None:
-                  try:
-                      jobs = root_seen.tk.call("after", "info")
-                  except tk.TclError:
-                      pass
-              record("pending", where=where,
-                     resize_job=getattr(editor_seen, "_parameter_area_resize_job", None),
-                     tracked_jobs=sorted(resize_jobs), after_jobs=jobs, omitted=omitted)
+                     "event": event, "nodeid": current, "phase": phase, **details}
+              os.write(FD, (json.dumps(row, separators=(",", ":")) + "\n").encode())
 
 
           @pytest.hookimpl(hookwrapper=True, tryfirst=True)
           def pytest_runtest_protocol(item, nextitem):
-              global phase, nodeid, bindings_exist, editor_seen, root_seen
-              if item.nodeid not in selected_ids:
+              global current, phase
+              if item.nodeid not in selected:
                   yield
                   return
-              phase = "protocol"
-              nodeid = item.nodeid
-              bindings_exist = False
-              editor_seen = None
-              root_seen = None
-              resize_jobs.clear()
+              current, phase = item.nodeid, "protocol"
               record("test_start")
-              instrument_geometry = item.nodeid.startswith(SIZING_PREFIX)
-
-              def wrap(cls, name, factory):
-                  original = getattr(cls, name)
-                  originals[(cls, name)] = original
-                  setattr(cls, name, factory(original))
-
-              def update_factory(original):
-                  @functools.wraps(original)
-                  def traced(self):
-                      global root_seen
-                      if isinstance(self, tk.Tk):
-                          root_seen = self
-                      start = time.monotonic_ns()
-                      record("update_enter", widget=str(self))
-                      try:
-                          return original(self)
-                      finally:
-                          record("update_exit", widget=str(self),
-                                 ms_elapsed=round((time.monotonic_ns() - start) / 1_000_000, 3))
-                  return traced
-
-              def after_idle_factory(original):
-                  @functools.wraps(original)
-                  def traced(self, func, *args):
-                      relevant = getattr(func, "__name__", "") == "_run_pending_parameter_area_resize"
-                      if relevant:
-                          record("after_idle_schedule", widget=str(self))
-                      job = None
-
-                      @functools.wraps(func)
-                      def called(*call_args):
-                          if relevant:
-                              resize_jobs.discard(job)
-                              record("after_idle_execute", widget=str(self), job=job)
-                          return func(*call_args)
-
-                      job = original(self, called, *args)
-                      if relevant:
-                          resize_jobs.add(job)
-                          record("after_idle_job", job=job)
-                      return job
-                  return traced
-
-              def after_cancel_factory(original):
-                  @functools.wraps(original)
-                  def traced(self, job):
-                      if job in resize_jobs:
-                          resize_jobs.discard(job)
-                          record("after_idle_cancel", job=job, widget=str(self))
-                      return original(self, job)
-                  return traced
-
-              def bind_factory(original):
-                  @functools.wraps(original)
-                  def traced(self, *args, **kwargs):
-                      global bindings_exist, editor_seen
-                      editor_seen = self
-                      result = original(self, *args, **kwargs)
-                      bindings_exist = True
-                      record("bindings_ready")
-                      return result
-                  return traced
-
-              def resize_event_factory(original):
-                  @functools.wraps(original)
-                  def traced(self, event):
-                      record("configure_callback", widget=str(getattr(event, "widget", "?")),
-                             job=self._parameter_area_resize_job,
-                             running=self._parameter_area_resize_running)
-                      return original(self, event)
-                  return traced
-
-              def pending_factory(original):
-                  @functools.wraps(original)
-                  def traced(self):
-                      record("pending_fit_enter", job=self._parameter_area_resize_job)
-                      start = time.monotonic_ns()
-                      try:
-                          return original(self)
-                      finally:
-                          record("pending_fit_exit",
-                                 ms_elapsed=round((time.monotonic_ns() - start) / 1_000_000, 3))
-                  return traced
-
-              def fit_factory(original):
-                  @functools.wraps(original)
-                  def traced(self):
-                      start = time.monotonic_ns()
-                      record("fit_enter", **geometry(self))
-                      try:
-                          return original(self)
-                      finally:
-                          record("fit_exit",
-                                 ms_elapsed=round((time.monotonic_ns() - start) / 1_000_000, 3),
-                                 **geometry(self))
-                  return traced
-
-              if instrument_geometry:
-                  wrap(tk.Misc, "update_idletasks", update_factory)
-                  wrap(tk.Misc, "after_idle", after_idle_factory)
-                  wrap(tk.Misc, "after_cancel", after_cancel_factory)
-                  wrap(ParameterEditorWindow, "_bind_parameter_layout_events", bind_factory)
-                  wrap(ParameterEditorWindow, "_on_main_frame_resize", resize_event_factory)
-                  wrap(ParameterEditorWindow, "_run_pending_parameter_area_resize", pending_factory)
-                  wrap(ParameterEditorWindow, "_resize_parameter_area_to_fit", fit_factory)
-              try:
-                  yield
-              finally:
-                  if instrument_geometry:
-                      pending("protocol_end")
-                  record("test_end", omitted=omitted)
-                  for (cls, name), original in originals.items():
-                      setattr(cls, name, original)
-                  originals.clear()
-                  nodeid = None
+              yield
+              record("test_end")
+              current = None
 
 
           def phase_hook(name):
               @pytest.hookimpl(hookwrapper=True, tryfirst=True)
               def hook(item):
                   global phase
-                  if item.nodeid not in selected_ids:
+                  if item.nodeid not in selected:
                       yield
                       return
                   phase = name
                   start = time.monotonic_ns()
                   record("phase_start")
                   outcome = yield
-                  record("phase_end", ms_elapsed=round((time.monotonic_ns() - start) / 1_000_000, 3),
-                         outcome=str(outcome.excinfo[0].__name__) if outcome.excinfo else "ok")
-                  if name == "teardown" and item.nodeid.startswith(SIZING_PREFIX):
-                      pending("teardown_end")
+                  record("phase_end",
+                         ms_elapsed=round((time.monotonic_ns() - start) / 1_000_000, 3),
+                         outcome=(outcome.excinfo[0].__name__ if outcome.excinfo else "ok"))
               return hook
 
 
@@ -350,98 +224,32 @@ jobs:
           pytest_runtest_call = phase_hook("call")
           pytest_runtest_teardown = phase_hook("teardown")
           PY_PLUGIN
-          cat > "$RUNNER_TEMP/amc_tk_watchdog.py" <<'PY_WATCHDOG'
-          import json
-          import os
-          from pathlib import Path
-          import shutil
-          import subprocess
-          import sys
-          import time
-
-          trace, done, output = map(Path, sys.argv[1:4])
-          pid = int(sys.argv[4])
-          sample = shutil.which('sample')
-          (output / 'sample-availability.txt').write_text(f'sample utility: {sample}\n')
-          offset = 0
-          open_calls = []
-          sampled = False
-          while not done.exists():
-              if trace.exists():
-                  with trace.open(encoding='utf-8') as stream:
-                      stream.seek(offset)
-                      while True:
-                          line = stream.readline()
-                          if not line:
-                              break
-                          try:
-                              row = json.loads(line)
-                          except json.JSONDecodeError:
-                              continue
-                          event = row.get('event')
-                          if event == 'update_enter':
-                              open_calls.append((event, time.monotonic(), row))
-                          elif event == 'update_exit':
-                              match = 'update_enter'
-                              for index in range(len(open_calls) - 1, -1, -1):
-                                  if open_calls[index][0] == match:
-                                      open_calls.pop(index)
-                                      break
-                      offset = stream.tell()
-              now = time.monotonic()
-              blocked = next((entry for entry in open_calls if now - entry[1] >= 10), None)
-              if blocked and not sampled:
-                  sampled = True
-                  call = blocked[2]
-                  (output / 'sample-trigger.json').write_text(json.dumps({
-                      'pid': pid, 'observed_duration_s': round(now - blocked[1], 3),
-                      'call': call, 'open_calls': [entry[2] for entry in open_calls]
-                  }, indent=2))
-                  if sample is None:
-                      (output / 'sample-error.txt').write_text('macOS sample utility unavailable\n')
-                  else:
-                      try:
-                          with (output / 'sample-command.log').open('w') as log:
-                              result = subprocess.run(
-                                  [sample, str(pid), '5', '-file', str(output / 'native-sample.txt')],
-                                  stdout=log, stderr=subprocess.STDOUT, check=False, timeout=15,
-                              )
-                          (output / 'sample-exit.txt').write_text(f'sample exit: {result.returncode}\n')
-                      except subprocess.TimeoutExpired:
-                          (output / 'sample-error.txt').write_text('sample exceeded 15 seconds\n')
-              time.sleep(0.2)
-          (output / 'watchdog-finished.txt').write_text(
-              f'sampled: {sampled}\nopen calls at finish: {len(open_calls)}\n'
-          )
-          PY_WATCHDOG
-          command -v sample > "$diag/sample-availability-shell.txt" || true
           export PYTHONPATH="$RUNNER_TEMP${PYTHONPATH:+:$PYTHONPATH}"
-          export AMC_TK_GEOMETRY_TRACE="$diag/geometry-trace.jsonl"
-          export AMC_TK_SELECTED_IDS="$diag/selected-test-ids.txt"
-          printf '%s\n' 'Normal collection; plugin validates and selects the 168-test contiguous GUI sequence.' > "$diag/selection-plan.txt"
-          PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1 "$VIRTUAL_ENV/bin/python" -m pytest \
-            -p amc_tk_geometry_probe --timeout=30 --timeout-method=thread \
-            -o "cache_dir=$RUNNER_TEMP/amc-tk-pytest-cache" -vv > "$diag/pytest.log" 2>&1 &
-          pytest_pid=$!
-          printf 'pytest PID: %s\n' "$pytest_pid" > "$diag/pytest-pid.txt"
-          "$VIRTUAL_ENV/bin/python" "$RUNNER_TEMP/amc_tk_watchdog.py" \
-            "$diag/geometry-trace.jsonl" "$diag/pytest-done" "$diag" "$pytest_pid" &
-          watchdog_pid=$!
-          set +e
-          wait "$pytest_pid"
-          status=$?
-          set -e
-          printf 'pytest exit: %s\n' "$status" > "$diag/pytest-exit.txt"
-          touch "$diag/pytest-done"
-          wait "$watchdog_pid"
-          cat "$diag/pytest.log"
-          exit "$status"
+          export PYTHONFAULTHANDLER=1
+          export PYTHONUNBUFFERED=1
+          export AMC_TK_TRIAL=PLAN
+          "$VIRTUAL_ENV/bin/python" -m pytest -p amc_tk_order_probe --collect-only -q \
+            -o "cache_dir=$RUNNER_TEMP/amc-tk-pytest-cache" \
+            > "$diag/selection-preflight.log" 2>&1
+          cat "$diag/selection-manifest.json"
+          for trial in A B C; do
+            export AMC_TK_TRIAL="$trial"
+            set +e
+            "$VIRTUAL_ENV/bin/python" -X faulthandler -m pytest -p amc_tk_order_probe \
+              --timeout=30 --timeout-method=thread \
+              -o "cache_dir=$RUNNER_TEMP/amc-tk-pytest-cache" -vv 2>&1 \
+              | tee "$diag/$trial-pytest.log"
+            status=${PIPESTATUS[0]}
+            set -e
+            printf 'pytest exit: %s\n' "$status" > "$diag/$trial-exit.txt"
+            printf 'Trial %s pytest exit: %s\n' "$trial" "$status"
+          done
 
       - name: Upload Tk diagnostic evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: macos-python315-tk-unwrapped-predecessors
+          name: macos-python315-tk-three-module-selections
           path: ${{ runner.temp }}/amc-tk-diagnostic/
           if-no-files-found: warn
           retention-days: 3
