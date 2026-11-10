@@ -99,8 +99,56 @@ def run_reduced(mode: str) -> None:
         mark("reduced: after destroy")
 
 
+def run_no_second_withdrawal() -> None:
+    """Process the second root's idle events without withdrawing it."""
+    mark("no-withdraw: before first Tk()")
+    first = tk.Tk()
+    mark("no-withdraw: after first Tk(); before destroy")
+    first.destroy()
+    mark("no-withdraw: after first destroy")
+    mark("no-withdraw: before second Tk()")
+    second = tk.Tk()
+    mark("no-withdraw: after second Tk(); before update_idletasks")
+    try:
+        second.update_idletasks()
+        mark("no-withdraw: after update_idletasks")
+    finally:
+        mark("no-withdraw: before second destroy")
+        second.destroy()
+        mark("no-withdraw: after second destroy")
+
+
+def run_one_interpreter() -> None:
+    """Destroy a Toplevel while retaining its root interpreter."""
+    mark("one-interpreter: before Tk()")
+    root = tk.Tk()
+    mark("one-interpreter: after Tk()")
+    try:
+        mark("one-interpreter: before Toplevel()")
+        window = tk.Toplevel(root)
+        mark("one-interpreter: after Toplevel(); before destroy")
+        window.destroy()
+        mark("one-interpreter: after Toplevel.destroy(); before root.withdraw")
+        root.withdraw()
+        mark("one-interpreter: after root.withdraw(); before update_idletasks")
+        root.update_idletasks()
+        mark("one-interpreter: after update_idletasks")
+    finally:
+        mark("one-interpreter: before root.destroy")
+        root.destroy()
+        mark("one-interpreter: after root.destroy")
+
+
 def main() -> None:
     """Run one independently launched diagnostic mode."""
+    if len(sys.argv) == 2 and sys.argv[1] in {"no-withdraw", "one-interpreter"}:
+        mark(f"mode: {sys.argv[1]}; Python: {sys.version}; executable: {sys.executable}")
+        if sys.argv[1] == "no-withdraw":
+            run_no_second_withdrawal()
+        else:
+            run_one_interpreter()
+        mark("result: completed")
+        return
     if len(sys.argv) == 2 and sys.argv[1] in {"minimum", "theme-only", "dpi-only", "font-only"}:
         mark(f"mode: {sys.argv[1]}; Python: {sys.version}; executable: {sys.executable}")
         run_reduced(sys.argv[1])

@@ -1,4 +1,4 @@
-name: Standalone macOS Tk distribution comparison
+name: Standalone macOS Tk interpreter lifecycle diagnostic
 
 on:
   workflow_dispatch:
@@ -84,140 +84,99 @@ jobs:
           root.destroy()
           PY
 
-      - name: Set up latest stable Python 3.14 on macOS
-        id: python314
-        continue-on-error: true
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.14'
-          check-latest: true
-
-      - name: Compare minimum Tk lifecycle across three Python distributions
+      - name: Run standalone Tk interpreter lifecycle trials V1 through V4
         shell: bash
-        env:
-          PY314_PATH: ${{ steps.python314.outputs.python-path }}
-          PY314_OUTCOME: ${{ steps.python314.outcome }}
         run: |
           set -euo pipefail
           diag="$AMC_TK_DIAG"
-          script="diagnostics/tk_root_idle_reproducer.py"
-          test -f "$script"
+          python_script="diagnostics/tk_root_idle_reproducer.py"
+          tcl_script="diagnostics/tk_interp_idle_reproducer.tcl"
+          test -f "$python_script"
+          test -f "$tcl_script"
+          cp "$python_script" "$diag/tk_root_idle_reproducer.py"
+          cp "$tcl_script" "$diag/tk_interp_idle_reproducer.tcl"
+          shasum -a 256 "$python_script" "$tcl_script" > "$diag/script-sha256.txt"
           printf 'runner architecture: %s\n' "$(uname -m)" > "$diag/runner-architecture.txt"
           if [ "$(uname -m)" != arm64 ]; then
             printf 'unavailable: expected macOS arm64 runner\n' > "$diag/runner-status.txt"
             exit 0
           fi
-          cp "$script" "$diag/tk_root_idle_reproducer.py"
-          shasum -a 256 "$script" > "$diag/script-sha256.txt"
           export PYTHONFAULTHANDLER=1
           export PYTHONUNBUFFERED=1
-          cat > "$diag/runtime_probe.py" <<'PY_RUNTIME'
-          import _tkinter
-          import os
-          import platform
-          import subprocess
-          import sys
-          import tkinter as tk
-
-          print('platform:', platform.platform(), flush=True)
-          print('architecture:', platform.machine(), flush=True)
-          print('python build:', sys.version, flush=True)
-          print('executable:', sys.executable, flush=True)
-          print('real executable:', os.path.realpath(sys.executable), flush=True)
-          print('_tkinter:', _tkinter.__file__, flush=True)
-          print('real _tkinter:', os.path.realpath(_tkinter.__file__), flush=True)
-          print('otool -L executable:', flush=True)
-          subprocess.run(['/usr/bin/otool', '-L', os.path.realpath(sys.executable)], check=False)
-          print('otool -L _tkinter:', flush=True)
-          subprocess.run(['/usr/bin/otool', '-L', _tkinter.__file__], check=False)
-          root = tk.Tk()
-          print('Tcl patchlevel:', root.tk.call('info', 'patchlevel'), flush=True)
-          print('Tk patchlevel:', root.tk.call('package', 'require', 'Tk'), flush=True)
-          print('loaded Tcl/Tk libraries:', flush=True)
-          result = subprocess.run(['/usr/sbin/lsof', '-p', str(os.getpid())], capture_output=True, text=True, check=False)
-          for line in result.stdout.splitlines():
-              if any(name in line for name in ('_tkinter', 'libtcl', 'libtk', 'Tcl.framework', 'Tk.framework')):
-                  print(line, flush=True)
-          root.destroy()
-          PY_RUNTIME
-          run_trial() {
-            trial="$1"
-            executable="$2"
-            expected="$3"
-            cp "$diag/script-sha256.txt" "$diag/$trial-script-sha256.txt"
-            if [ -z "$executable" ] || [ ! -x "$executable" ]; then
-              printf 'unavailable: Python executable missing: %s\n' "$executable" > "$diag/$trial-status.txt"
-              return
-            fi
-            set +e
-            "$executable" -c 'import sys; v=sys.version_info; e=sys.argv[1]; ok=(v[:3]==(3,15,2) if e=="3.15.2" else v[:2]==(3,14)) and v.releaselevel=="final"; print(sys.version); sys.exit(0 if ok else 1)' "$expected" > "$diag/$trial-version-check.txt" 2>&1
-            version_status=$?
-            set -e
-            if [ "$version_status" -ne 0 ]; then
-              printf 'unavailable: expected stable Python %s; version check exit %s\n' "$expected" "$version_status" > "$diag/$trial-status.txt"
-              return
-            fi
-            set +e
-            "$executable" -X faulthandler -u "$diag/runtime_probe.py" > "$diag/$trial-runtime.txt" 2>&1
-            probe_status=$?
-            set -e
-            printf '%s\n' "$probe_status" > "$diag/$trial-runtime-exit.txt"
-            printf '%q ' "$executable" -X faulthandler -u "$script" minimum > "$diag/$trial-command.txt"
+          python_executable="$VIRTUAL_ENV/bin/python"
+          for trial in V1 V2 V3; do
+            case "$trial" in
+              V1) mode=minimum ;;
+              V2) mode=no-withdraw ;;
+              V3) mode=one-interpreter ;;
+            esac
+            cp "$diag/runtime.txt" "$diag/$trial-runtime.txt"
+            shasum -a 256 "$python_script" > "$diag/$trial-script-sha256.txt"
+            printf '%q ' "$python_executable" -X faulthandler -u "$python_script" "$mode" > "$diag/$trial-command.txt"
             printf '\n' >> "$diag/$trial-command.txt"
             set +e
-            "$executable" -X faulthandler -u "$script" minimum 2>&1 | tee "$diag/$trial-output.log"
+            "$python_executable" -X faulthandler -u "$python_script" "$mode" 2>&1 | tee "$diag/$trial-output.log"
             trial_status=${PIPESTATUS[0]}
             set -e
             printf '%s\n' "$trial_status" > "$diag/$trial-exit.txt"
-            printf 'executed: process exit %s; runtime probe exit %s\n' "$trial_status" "$probe_status" > "$diag/$trial-status.txt"
-            printf '%s exit: %s\n' "$trial" "$trial_status"
-          }
-          u1_python="$VIRTUAL_ENV/bin/python"
-          run_trial U1 "$u1_python" 3.15.2
-          uv_dir="$RUNNER_TEMP/uv-managed-python"
-          set +e
-          env -u VIRTUAL_ENV UV_PYTHON_INSTALL_DIR="$uv_dir" uv python install --no-config 3.15.2 > "$diag/U2-install.log" 2>&1
-          install_status=$?
-          set -e
-          printf '%s\n' "$install_status" > "$diag/U2-install-exit.txt"
-          if [ "$install_status" -eq 0 ]; then
+            printf 'executed: process exit %s\n' "$trial_status" > "$diag/$trial-status.txt"
+          done
+          cat > "$diag/V4-probe.tcl" <<'TCL_PROBE'
+          puts "Tcl: [info patchlevel]; executable: [info nameofexecutable]"
+          flush stdout
+          if {[info patchlevel] ne "9.0.4"} {exit 2}
+          interp create probe
+          set tk_version [interp eval probe {package require Tk}]
+          puts "Tk: $tk_version; loaded libraries: [interp eval probe {info loaded}]"
+          flush stdout
+          if {$tk_version ne "9.0.5"} {exit 3}
+          interp eval probe {destroy .}
+          interp delete probe
+          TCL_PROBE
+          printf '%s\n' 'V4 deletes the first Tcl slave interpreter; Python V1 retains the first Tk object after destroy(). This is a related lifecycle comparison, not an exact translation.' > "$diag/V4-semantics.txt"
+          shasum -a 256 "$tcl_script" > "$diag/V4-script-sha256.txt"
+          base_prefix=$("$python_executable" -c 'import sys; print(sys.base_prefix)')
+          {
+            find "$base_prefix" -type f -name 'tclsh*' 2>/dev/null || :
+            command -v tclsh9.0 || :
+            command -v tclsh || :
+          } | awk 'NF && !seen[$0]++' > "$diag/V4-candidates.txt"
+          selected_tclsh=''
+          candidate_number=0
+          while IFS= read -r candidate; do
+            candidate_number=$((candidate_number + 1))
+            if [ ! -x "$candidate" ]; then
+              printf 'not executable: %s\n' "$candidate" > "$diag/V4-probe-$candidate_number.log"
+              continue
+            fi
             set +e
-            u2_python=$(env -u VIRTUAL_ENV UV_PYTHON_INSTALL_DIR="$uv_dir" uv python find --managed-python --no-config 3.15.2 2>> "$diag/U2-install.log")
-            find_status=$?
+            "$candidate" "$diag/V4-probe.tcl" > "$diag/V4-probe-$candidate_number.log" 2>&1
+            probe_status=$?
             set -e
-            printf '%s\n' "$find_status" > "$diag/U2-find-exit.txt"
-            if [ "$find_status" -eq 0 ]; then
-              printf 'uv managed executable: %s\n' "$u2_python" > "$diag/U2-distribution-check.txt"
-              case "$u2_python" in
-                "$uv_dir"/*) ;;
-                *) printf 'unavailable: uv executable outside isolated install directory\n' > "$diag/U2-status.txt"; u2_python='' ;;
-              esac
-              if [ -n "$u2_python" ]; then
-                set +e
-                u1_tk=$("$u1_python" -c 'import _tkinter, os; print(os.path.realpath(_tkinter.__file__))')
-                u1_tk_status=$?
-                u2_tk=$("$u2_python" -c 'import _tkinter, os; print(os.path.realpath(_tkinter.__file__))')
-                u2_tk_status=$?
-                set -e
-                printf 'U1 _tkinter: %s (exit %s)\nU2 _tkinter: %s (exit %s)\n' "$u1_tk" "$u1_tk_status" "$u2_tk" "$u2_tk_status" >> "$diag/U2-distribution-check.txt"
-                if [ "$u1_tk_status" -ne 0 ] || [ "$u2_tk_status" -ne 0 ]; then
-                  printf 'unavailable: _tkinter binary comparison failed\n' > "$diag/U2-status.txt"
-                elif [ "$u1_tk" = "$u2_tk" ]; then
-                  printf 'unavailable: U2 resolved to U1 _tkinter binary\n' > "$diag/U2-status.txt"
-                else
-                  run_trial U2 "$u2_python" 3.15.2
-                fi
-              fi
-            else
-              printf 'unavailable: uv-managed Python lookup failed\n' > "$diag/U2-status.txt"
+            printf '%s\n' "$probe_status" > "$diag/V4-probe-$candidate_number-exit.txt"
+            if [ "$probe_status" -eq 0 ]; then
+              selected_tclsh="$candidate"
+              cp "$diag/V4-probe-$candidate_number.log" "$diag/V4-runtime.txt"
+              break
+            fi
+          done < "$diag/V4-candidates.txt"
+          if [ -n "$selected_tclsh" ]; then
+            printf 'selected Tcl executable: %s\n' "$selected_tclsh" >> "$diag/V4-runtime.txt"
+            /usr/bin/otool -L "$selected_tclsh" >> "$diag/V4-runtime.txt" 2>&1 || :
+            printf '%q ' "$selected_tclsh" "$tcl_script" > "$diag/V4-command.txt"
+            printf '\n' >> "$diag/V4-command.txt"
+            set +e
+            { "$selected_tclsh" "$tcl_script"; } 2>&1 | tee "$diag/V4-output.log"
+            v4_status=${PIPESTATUS[0]}
+            set -e
+            printf '%s\n' "$v4_status" > "$diag/V4-exit.txt"
+            printf 'executed: process exit %s\n' "$v4_status" > "$diag/V4-status.txt"
+            report_dir="$HOME/Library/Logs/DiagnosticReports"
+            if [ -d "$report_dir" ]; then
+              find "$report_dir" -maxdepth 1 -type f \( -name 'tclsh*.ips' -o -name 'tclsh*.crash' \) -mmin -5 -exec cp {} "$diag/" \; || :
             fi
           else
-            printf 'unavailable: uv-managed Python install failed\n' > "$diag/U2-status.txt"
-          fi
-          if [ "$PY314_OUTCOME" = success ]; then
-            run_trial U3 "$PY314_PATH" 3.14
-          else
-            printf 'unavailable: setup-python 3.14 outcome %s\n' "$PY314_OUTCOME" > "$diag/U3-status.txt"
+            printf 'unavailable: no tclsh candidate loaded Tcl 9.0.4 and Tk 9.0.5 in a slave interpreter\n' > "$diag/V4-status.txt"
           fi
           git status --short > "$diag/after-status.txt"
           git diff HEAD -- > "$diag/after-tracked.diff"
@@ -241,7 +200,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: macos-tk-standalone-u1-u3
+          name: macos-tk-standalone-v1-v4
           path: ${{ runner.temp }}/amc-tk-diagnostic/
           if-no-files-found: warn
           retention-days: 3
