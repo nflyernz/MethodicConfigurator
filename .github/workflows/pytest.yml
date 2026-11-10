@@ -1,4 +1,4 @@
-name: Pytest macOS Tk unwrapped-predecessor diagnostic
+name: Pytest macOS Tk PairTuple-only diagnostic
 
 on:
   workflow_dispatch:
@@ -84,7 +84,7 @@ jobs:
           root.destroy()
           PY
 
-      - name: Run three original-order module selections
+      - name: Run PairTuple-only trial with conditional control
         shell: bash
         run: |
           set -euo pipefail
@@ -108,11 +108,11 @@ jobs:
           TARGET = EDITOR + "TestWindowSizing::test_user_can_close_editor_with_resize_queued[main-frame]"
           COUNTS = {PAIR: 46, APPLICATION: 16, COMPARE: 33, UI: 1, TARGET: 1}
           GROUPS = {
+              "D": (PAIR, TARGET),
               "A": (PAIR, COMPARE, UI, TARGET),
-              "B": (APPLICATION, COMPARE, UI, TARGET),
-              "C": (PAIR, APPLICATION, COMPARE, UI, TARGET),
           }
-          EXPECTED = {"A": 81, "B": 51, "C": 97}
+          EXPECTED = {"D": (47, "0d3a8cc22d570c0312d7e78492b28c004dfd2c737e1eefd7167bbc404def36d3"),
+                      "A": (81, "78f9d6ce2dabd3ccef0e9ea580138329f575479a2e7aa86d5b51bb905872163e")}
           DIAG = Path(os.environ["AMC_TK_DIAG"])
           TRIAL = os.environ["AMC_TK_TRIAL"]
           START = time.monotonic_ns()
@@ -146,12 +146,13 @@ jobs:
                   chosen = [item for item in items if any(matches(item.nodeid, group)
                                                             for group in included)]
                   chosen_ids = [item.nodeid for item in chosen]
-                  if len(chosen_ids) != EXPECTED[name]:
-                      raise pytest.UsageError(f"trial {name} count changed")
                   text = "\n".join(chosen_ids) + "\n"
+                  digest = hashlib.sha256(text.encode()).hexdigest()
+                  if (len(chosen_ids), digest) != EXPECTED[name]:
+                      raise pytest.UsageError(f"trial {name} IDs, count or order changed")
                   (DIAG / f"{name}-selected-test-ids.txt").write_text(text)
                   result[name] = {"count": len(chosen_ids),
-                                  "sha256": hashlib.sha256(text.encode()).hexdigest(),
+                                  "sha256": digest,
                                   "first": chosen_ids[0], "last": chosen_ids[-1]}
               return result
 
@@ -161,16 +162,9 @@ jobs:
               global FD
               manifest = selection(items)
               path = DIAG / "selection-manifest.json"
-              if TRIAL == "PLAN":
+              if TRIAL == "D":
                   path.write_text(json.dumps(manifest, indent=2) + "\n")
-                  chosen = [item for item in items if any(matches(item.nodeid, group)
-                                                            for group in GROUPS["C"])]
-                  chosen_ids = {item.nodeid for item in chosen}
-                  config.hook.pytest_deselected(
-                      items=[item for item in items if item.nodeid not in chosen_ids])
-                  items[:] = chosen
-                  return
-              if TRIAL not in GROUPS or json.loads(path.read_text()) != manifest:
+              elif TRIAL != "A" or json.loads(path.read_text()) != manifest:
                   raise pytest.UsageError("trial selection differs from preflight manifest")
               chosen = [item for item in items if any(matches(item.nodeid, group)
                                                         for group in GROUPS[TRIAL])]
@@ -227,29 +221,31 @@ jobs:
           export PYTHONPATH="$RUNNER_TEMP${PYTHONPATH:+:$PYTHONPATH}"
           export PYTHONFAULTHANDLER=1
           export PYTHONUNBUFFERED=1
-          export AMC_TK_TRIAL=PLAN
-          "$VIRTUAL_ENV/bin/python" -m pytest -p amc_tk_order_probe --collect-only -q \
-            -o "cache_dir=$RUNNER_TEMP/amc-tk-pytest-cache" \
-            > "$diag/selection-preflight.log" 2>&1
-          cat "$diag/selection-manifest.json"
-          for trial in A B C; do
+          run_trial() {
+            trial="$1"
             export AMC_TK_TRIAL="$trial"
             set +e
             "$VIRTUAL_ENV/bin/python" -X faulthandler -m pytest -p amc_tk_order_probe \
               --timeout=30 --timeout-method=thread \
               -o "cache_dir=$RUNNER_TEMP/amc-tk-pytest-cache" -vv 2>&1 \
               | tee "$diag/$trial-pytest.log"
-            status=${PIPESTATUS[0]}
+            trial_status=${PIPESTATUS[0]}
             set -e
-            printf 'pytest exit: %s\n' "$status" > "$diag/$trial-exit.txt"
-            printf 'Trial %s pytest exit: %s\n' "$trial" "$status"
-          done
+            printf 'pytest exit: %s\n' "$trial_status" > "$diag/$trial-exit.txt"
+            printf 'Trial %s pytest exit: %s\n' "$trial" "$trial_status"
+          }
+          run_trial D
+          if [ "$trial_status" -eq 0 ]; then
+            run_trial A
+          else
+            printf 'Trial A skipped because Trial D exited %s\n' "$trial_status" > "$diag/A-skipped.txt"
+          fi
 
       - name: Upload Tk diagnostic evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: macos-python315-tk-three-module-selections
+          name: macos-python315-tk-pairtuple-only
           path: ${{ runner.temp }}/amc-tk-diagnostic/
           if-no-files-found: warn
           retention-days: 3
